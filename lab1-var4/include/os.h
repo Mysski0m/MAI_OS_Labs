@@ -1,5 +1,4 @@
-#ifndef OS_H
-#define OS_H
+#pragma once
 
 #include <string>
 #include <cstddef>
@@ -24,5 +23,3 @@ int LinkStdinWithPipe(pipe_t pipe);
 int LinkStderrWithPipe(pipe_t pipe);
 void AddSignalHandler(signal_t sig, SignalHandler_t handler);
 int ReadFromStdin(char* buffer, std::size_t size);
-
-#endif

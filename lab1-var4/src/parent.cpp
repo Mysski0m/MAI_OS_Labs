@@ -29,7 +29,7 @@ void OnChildKilled(signal_t signum) {
 void RunParentProcess() {
     AddSignalHandler(ChildDeathSig, OnChildKilled);
 
-    std::printf("Введите выходной файл: ");
+    std::printf("Enter result file name: ");
     char output_file[kBuffer];
     if (!std::fgets(output_file, kBuffer, stdin)) {
         PrintLastError();
@@ -37,7 +37,7 @@ void RunParentProcess() {
     }
     output_file[strcspn(output_file, "\n")] = '\0';
 
-    std::printf("Введите числа (через пробел): ");
+    std::printf("Enter numbers (separator - space): ");
     char numbers_line[kBuffer];
     if (!std::fgets(numbers_line, kBuffer, stdin)) {
         PrintLastError();

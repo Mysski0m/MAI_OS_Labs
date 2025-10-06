@@ -1,6 +1,6 @@
-#ifndef PARENT_H
-#define PARENT_H
+#pragma once
+#include "os.h"
 
 void RunParentProcess();
-
-#endif
+void PrintErrorFromChild(pipe_t pipe);
+void OnChildKilled(signal_t signum);
