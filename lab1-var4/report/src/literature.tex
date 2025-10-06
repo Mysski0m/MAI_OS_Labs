@@ -1,0 +1,326 @@
+\section{Исходная программа}
+
+\begin{lstlisting}[language=C++,caption=bin/child.cpp,captionpos=b]
+#include "child.h"
+#include <cstdio>
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        std::fprintf(stderr, "Usage: %s <output_file>\n", argv[0]);
+        return 1;
+    }
+    RunChildProcess(argv[1]);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=child.h,captionpos=b]
+#pragma once
+
+void RunChildProcess(const char* output_file);
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=exceptions.h,captionpos=b]
+#pragma once
+
+#include <stdexcept>
+#include <string>
+
+class OsException : public std::runtime_error {
+public:
+    explicit OsException(const std::string& message) : std::runtime_error(message) {}
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=os.h,captionpos=b]
+#pragma once
+
+#include <string>
+#include <cstddef>
+
+using pipe_t = int;
+using pid_t = int;
+using signal_t = int;
+using SignalHandler_t = void(*)(int);
+
+extern const int ChildDeathSig;
+extern const int BrokenPipeSig;
+
+int CreatePipe(pipe_t fd[2]);
+pid_t CloneProcess();
+int Exec(const char* path);
+void PrintLastError();
+int WaitForChild();
+int ClosePipe(pipe_t pipe);
+int WritePipe(pipe_t pipe, void* buffer, std::size_t bytes);
+int ReadPipe(pipe_t pipe, void* buffer, std::size_t bytes);
+int LinkStdinWithPipe(pipe_t pipe);
+int LinkStderrWithPipe(pipe_t pipe);
+void AddSignalHandler(signal_t sig, SignalHandler_t handler);
+int ReadFromStdin(char* buffer, std::size_t size);
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=parent.h,captionpos=b]
+#pragma once
+#include "os.h"
+
+void RunParentProcess();
+void PrintErrorFromChild(pipe_t pipe);
+void OnChildKilled(signal_t signum);
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=child.cpp,captionpos=b]
+#include "child.h"
+#include <cstdio>
+#include <cstdlib>
+
+void RunChildProcess(const char* output_file) {
+    float num = 0.0;
+    int scanned = std::scanf("%f", &num);
+    if (scanned != 1) {
+        std::fprintf(stderr, "Error: failed to read first number\n");
+        std::exit(1);
+    }
+
+    float divider = 1.0;
+    while ((scanned = std::scanf("%f", &divider)) == 1) {
+        if (divider == 0.0) {
+            std::fprintf(stderr, "Error: division by zero occurred\n");
+            std::exit(1);
+        }
+        num /= divider;
+    }
+
+    if (scanned == 0 && !std::feof(stdin)) {
+        std::fprintf(stderr, "Error: invalid input format\n");
+        std::exit(1);
+    }
+
+    if (std::ferror(stdin)) {
+        std::fprintf(stderr, "Error: error on stdin\n");
+        std::exit(1);
+    }
+
+    FILE* out = std::fopen(output_file, "w");
+    if (!out) {
+        std::perror("fopen");
+        std::exit(1);
+    }
+
+    std::fprintf(out, "%.6f\n", num);
+    std::fclose(out);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=os.cpp,captionpos=b]
+#include "os.h"
+#include "exceptions.h"
+#include <unistd.h>
+#include <sys/wait.h>
+#include <cstring>
+#include <csignal>
+#include <cstdio>
+
+const int ChildDeathSig = SIGCHLD;
+const int BrokenPipeSig = SIGPIPE;
+
+int CreatePipe(pipe_t fd[2]) {
+    return pipe(fd);
+}
+
+pid_t CloneProcess() {
+    return static_cast<pid_t>(fork());
+}
+
+int Exec(const char* path) {
+    return execl(path, path, nullptr);
+}
+
+void PrintLastError() {
+    perror("OS Error");
+}
+
+int WaitForChild() {
+    return wait(nullptr);
+}
+
+int ClosePipe(pipe_t pipe) {
+    return close(pipe);
+}
+
+int WritePipe(pipe_t pipe, void* buffer, std::size_t bytes) {
+    return static_cast<int>(write(pipe, buffer, bytes));
+}
+
+int ReadPipe(pipe_t pipe, void* buffer, std::size_t bytes) {
+    return static_cast<int>(read(pipe, buffer, bytes));
+}
+
+int LinkStdinWithPipe(pipe_t pipe) {
+    return dup2(pipe, STDIN_FILENO);
+}
+
+int LinkStderrWithPipe(pipe_t pipe) {
+    return dup2(pipe, STDERR_FILENO);
+}
+
+void AddSignalHandler(signal_t sig, SignalHandler_t handler) {
+    signal(sig, handler);
+}
+
+int ReadFromStdin(char* buffer, std::size_t size) {
+    return static_cast<int>(read(STDIN_FILENO, buffer, size));
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=parent.cpp,captionpos=b]
+#include "parent.h"
+#include "os.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unistd.h>
+
+const std::size_t kBuffer = 100;
+static pipe_t err_pipe_in;
+
+void PrintErrorFromChild(pipe_t pipe) {
+    char buffer[kBuffer];
+    int bytes = ReadPipe(pipe, buffer, kBuffer);
+    if (bytes > 0) {
+        std::fprintf(stderr, "Error from child: ");
+    }
+    while (bytes > 0) {
+        std::fwrite(buffer, sizeof(char), bytes, stderr);
+        bytes = ReadPipe(pipe, buffer, kBuffer);
+    }
+}
+
+void OnChildKilled(signal_t signum) {
+    PrintErrorFromChild(err_pipe_in);
+    std::exit(-1);
+}
+
+void RunParentProcess() {
+    AddSignalHandler(ChildDeathSig, OnChildKilled);
+
+    std::printf("Enter result file name: ");
+    char output_file[kBuffer];
+    if (!std::fgets(output_file, kBuffer, stdin)) {
+        PrintLastError();
+        std::exit(1);
+    }
+    output_file[strcspn(output_file, "\n")] = '\0';
+
+    std::printf("Enter numbers (separator - space): ");
+    char numbers_line[kBuffer];
+    if (!std::fgets(numbers_line, kBuffer, stdin)) {
+        PrintLastError();
+        std::exit(1);
+    }
+
+    pipe_t input_pipe[2];
+    pipe_t err_pipe[2];
+    if (CreatePipe(input_pipe) == -1 || CreatePipe(err_pipe) == -1) {
+        PrintLastError();
+        std::exit(1);
+    }
+
+    err_pipe_in = err_pipe[0];
+    pid_t child_id = CloneProcess();
+
+    if (child_id == 0) { // child
+        if (LinkStdinWithPipe(input_pipe[0]) == -1 ||
+            LinkStderrWithPipe(err_pipe[1]) == -1) {
+            PrintLastError();
+            std::exit(1);
+        }
+        ClosePipe(input_pipe[1]);
+        ClosePipe(err_pipe[0]);
+
+        const char* child_argv[] = {"./child", output_file, nullptr};
+        execl("./child", "./child", output_file, nullptr);
+
+        PrintLastError();
+        std::exit(1);
+    } else if (child_id == -1) {
+        PrintLastError();
+        std::exit(1);
+    } else { // parent
+        ClosePipe(input_pipe[0]);
+        ClosePipe(err_pipe[1]);
+
+        WritePipe(input_pipe[1], numbers_line, std::strlen(numbers_line));
+        ClosePipe(input_pipe[1]);
+
+        PrintErrorFromChild(err_pipe[0]);
+        ClosePipe(err_pipe[0]);
+
+        WaitForChild();
+    }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=main.cpp,captionpos=b]
+#include "parent.h"
+
+int main() {
+    RunParentProcess();
+    return 0;
+}
+\end{lstlisting}
+\section{Strace}
+\begin{verbatim}
+execve("./main", ["./main"], 0x7ffc71d22640 /* 26 vars */) = 0
+brk(NULL)                               = 0x64b419a95000
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x796307c69000
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+fstat(3, {st_mode=S_IFREG|0644, st_size=20163, ...}) = 0
+mmap(NULL, 20163, PROT_READ, MAP_PRIVATE, 3, 0) = 0x796307c64000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\220\243\2\0\0\0\0\0"..., 832) = 832
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+fstat(3, {st_mode=S_IFREG|0755, st_size=2125328, ...}) = 0
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+mmap(NULL, 2170256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x796307a00000
+mmap(0x796307a28000, 1605632, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x796307a28000
+mmap(0x796307bb0000, 323584, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1b0000) = 0x796307bb0000
+mmap(0x796307bff000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1fe000) = 0x796307bff000
+mmap(0x796307c05000, 52624, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x796307c05000
+close(3)                                = 0
+mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x796307c61000
+arch_prctl(ARCH_SET_FS, 0x796307c61740) = 0
+set_tid_address(0x796307c61a10)         = 16642
+set_robust_list(0x796307c61a20, 24)     = 0
+rseq(0x796307c62060, 0x20, 0, 0x53053053) = 0
+mprotect(0x796307bff000, 16384, PROT_READ) = 0
+mprotect(0x64b3ed8dc000, 4096, PROT_READ) = 0
+mprotect(0x796307ca1000, 8192, PROT_READ) = 0
+prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+munmap(0x796307c64000, 20163)           = 0
+rt_sigaction(SIGCHLD, {sa_handler=0x64b3ed8da41f, sa_mask=[CHLD], sa_flags=SA_RESTORER|SA_RESTART, sa_restorer=0x796307a45330}, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
+fstat(1, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}) = 0
+getrandom("\x82\xe7\x50\xa0\xa4\x4c\xac\xa1", 8, GRND_NONBLOCK) = 8
+brk(NULL)                               = 0x64b419a95000
+brk(0x64b419ab6000)                     = 0x64b419ab6000
+fstat(0, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}) = 0
+write(1, "Enter result file name: ", 24) = 24
+read(0, "ans.txt\n", 1024)              = 8
+write(1, "Enter numbers (separator - space"..., 35) = 35
+read(0, "1 2 3455\n", 1024)             = 9
+pipe2([3, 4], 0)                        = 0
+pipe2([5, 6], 0)                        = 0
+clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x796307c61a10) = 16655
+close(3)                                = 0
+close(6)                                = 0
+write(4, "1 2 3455\n", 9)               = 9
+close(4)                                = 0
+read(5, "", 100)                        = 0
+--- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=16655, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+read(5, "", 100)                        = 0
+exit_group(-1)                          = ?
++++ exited with 255 +++
+\end{verbatim}
