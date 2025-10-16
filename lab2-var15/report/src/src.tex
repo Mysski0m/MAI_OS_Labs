@@ -1,0 +1,102 @@
+\section{Метод решения}
+
+Алгоритм решения задачи:
+
+\begin{enumerate}
+\item Пользователь в консоль вводит два параметра командной строки:
+    \begin{itemize}
+        \item rounds N — общее количество экспериментов (раундов),
+        \item max-threads M — максимальное число потоков, выполняемых одновременно.
+    \end{itemize}
+    Проверяется корректность входных данных (положительные целые числа).
+
+\item Общее число раундов N равномерно распределяется между M потоками.
+Остаток от деления N mod M добавляется к первому потоку для обеспечения полноты покрытия.
+
+\item Для каждого потока создаётся объект \texttt{std::thread}.
+Каждому потоку передаётся:
+    \begin{itemize}
+        \item Указатель на функцию обработки (\texttt{card\_function}),
+        \item Количество раундов для данного потока (типа \texttt{long long})
+    \end{itemize}
+\item Для каждого раунда:
+    \begin{itemize}
+        \item Колода из 52 карт (13 рангов × 4 масти) создаётся заново.
+        \item Колода случайным образом перемешивается с использованием \texttt{std::shuffle} и генератора \texttt{std::mt19937}, инициализированного энтропией\\ из \texttt{std::random\_device}.
+        \item Проверяется, совпадают ли достоинства первых двух карт.
+        \item При совпадении увеличивается локальный счётчик успешных исходов.
+    \end{itemize}
+\item После завершения всех раундов поток:
+    \begin{itemize}
+        \item Блокирует глобальный мьютекс (\texttt{std::mutex}) с помощью \texttt{std::lock\_guard},
+        \item Обновляет общие счётчики (\texttt{total\_rounds, total\_successes}),
+        \item Мьютекс автоматически разблокируется при выходе из области видимости.
+    \end{itemize}
+\item Главный поток ожидает завершения всех рабочих потоков с помощью метода \texttt{.join()}.
+Вычисляется экспериментальная вероятность:
+
+\begin{center}
+$P = \frac{total\_rounds}{total\_successes}$
+\end{center}
+\item После успешного завершения работы программа выводит:
+\begin{itemize}
+    \item Общее число раундов,
+    \item Число успешных исходов,
+    \item Экспериментальную вероятность,
+    \item Время выполнения в наносекундах и секундах (с использованием \texttt{std::chrono}.
+\end{itemize}
+\end{enumerate}
+\pagebreak
+Архитектура программы:
+
+\dirtree{%
+.1 lab2-var15/. 
+.2 bin/. 
+.2 build/.
+.2 include/.
+.3 deck.h.
+.3 monte\_carlo\_card.h.
+.2 src/.
+.3 deck.cpp.
+.3 monte\_carlo\_card.cpp.
+.2 main.cpp.
+.2 CMakeLists.txt.
+}
+
+Ссылки:
+
+\begin{itemize}
+\item \url{https://en.cppreference.com/w/cpp/chrono.html}
+\item \url{https://en.cppreference.com/w/cpp/thread/thread.html}
+\item \url{https://en.cppreference.com/w/cpp/thread/mutex.html}
+\item \url{https://en.cppreference.com/w/cpp/thread/lock_guard.html}
+\item \url{https://en.cppreference.com/w/cpp/numeric/random/rand.html}
+\item \url{https://en.cppreference.com/w/cpp/algorithm/random_shuffle.html}
+\item \url{https://en.cppreference.com/w/cpp/numeric/random/mersenne_twister_engine.html}
+\item \url{https://en.cppreference.com/w/cpp/algorithm.html}
+\item \url{https://en.cppreference.com/w/cpp/header/cstdlib.html}
+\end{itemize}
+
+\section{Описание программы}
+
+\texttt{main.cpp} --- точка входа в программу. Выполняет парсинг аргументов командной строки (\texttt{--rounds N}, \texttt{--max-threads M}), проверку их корректности, распределение вычислительной нагрузки между потоками и запуск многопоточного моделирования. После завершения всех потоков выводит статистику: общее число раундов, количество успешных исходов, экспериментальную вероятность и время выполнения.
+
+\texttt{include/deck.cpp} --- модуль работы с колодой карт. Содержит объявление структуры \texttt{Card} и функцию \texttt{CreateDeck()}, создающую стандартную колоду из 52 карт (13 достоинств × 4 масти).
+
+Основные функции:
+\begin{itemize} 
+    \item \texttt{std::vector<Card> CreateDeck();} --- создаёт стандартную колоду из 52 карт. Колода представлена вектором объектов \texttt{Card}, где каждый объект содержит поле \texttt{denomination} (достоинство карты от 0 до 12). Колода упорядочена по достоинствам (по 4 карты каждого ранга).
+\end{itemize}
+
+\texttt{include/monte\_carlo\_card.cpp} --- модуль логики моделирования методом Монте-Карло. Содержит глобальное состояние программы и функцию \texttt{card\_function()}, реализующую вычисления в отдельном потоке.
+
+Основные функции:
+\begin{itemize} 
+    \item \texttt{void card\_function(long long rounds);} --- выполняет заданное количество раундов в отдельном потоке:
+    \begin{itemize}
+        \item Для каждого раунда создаёт копию колоды и перемешивает её с использованием \texttt{std::shuffle} и генератора \texttt{std::mt19937}.
+        \item Проверяет, совпадают ли достоинства первых двух карт в перемешанной колоде.
+        \item При совпадении увеличивает локальный счётчик успешных исходов.
+        \item После завершения всех раундов обновляет глобальные счётчики\\ \texttt{total\_successes\_rounds} и \texttt{total\_rounds} под защитой мьютекса.
+    \end{itemize}
+\end{itemize}
