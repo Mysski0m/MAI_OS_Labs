@@ -1,13 +1,13 @@
 #pragma once
 
-#include <pthread.h>
+#include <mutex>
 
 struct GeneralThread {
     long long total_succeses_rounds = 0;
     long long total_rounds = 0;
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    std::mutex mutex;
 };
 
 extern GeneralThread gen_thread;
 
-void* card_function(void* arg);
+void card_function(long long rounds);

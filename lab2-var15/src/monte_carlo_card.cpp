@@ -3,13 +3,11 @@
 #include <random>
 #include <algorithm>
 #include <iostream>
+#include <mutex>
 
 GeneralThread gen_thread;
 
-void* card_function(void* arg) {
-    long long rounds = *static_cast<long long*>(arg);
-    delete static_cast<long long*>(arg);
-
+void card_function(long long rounds) {
     std::vector<Card> deck = CreateDeck();
     
     std::random_device rd;
@@ -25,10 +23,7 @@ void* card_function(void* arg) {
         }
     }
 
-    pthread_mutex_lock(&gen_thread.mutex);
+    std::lock_guard<std::mutex> lock(gen_thread.mutex);
     gen_thread.total_succeses_rounds += success_shuffles;
     gen_thread.total_rounds += rounds;
-    pthread_mutex_unlock(&gen_thread.mutex);
-
-    return nullptr;
 }

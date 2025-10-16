@@ -1,10 +1,12 @@
 #include "monte_carlo_card.h"
+#include "deck.h"
 #include <iostream>
 #include <vector>
 #include <chrono>
 #include <cstdlib>
-#include <pthread.h>
 #include <cstring>
+#include <thread>
+#include <mutex>
 
 constexpr std::size_t MAX_ROUNDS = 1000000;
 
@@ -33,22 +35,17 @@ int main(int argc, char* argv[]) {
     long long rounds_per_thread = total_rounds / max_threads;
     long long remainder = total_rounds % max_threads;
 
-    std::vector<pthread_t> threads(max_threads);
-    std::vector<long long*> args(max_threads); 
-
     auto start_time = std::chrono::steady_clock::now();
 
+    std::vector<std::thread> threads;
+    long long rounds_for_cur_thread; 
     for (int i = 0; i < max_threads; ++i) {
-        long long rounds_for_cur_thread = rounds_per_thread + (i == 0 ? remainder : 0);
-        args[i] = new long long(rounds_for_cur_thread);
-        if (pthread_create(&threads[i], nullptr, card_function, args[i]) != 0) {
-            std::cerr << "Failed to create thread №" << i << "\n";
-            return 1; 
-        }
+        rounds_for_cur_thread = rounds_per_thread + (i == 0 ? remainder : 0);
+        threads.emplace_back(card_function, rounds_for_cur_thread);
     }
-    
-    for (int i = 0; i < max_threads; ++i) {
-        pthread_join(threads[i], nullptr);
+
+    for (auto& t : threads) {
+        t.join();
     }
 
     auto end_time = std::chrono::steady_clock::now();
