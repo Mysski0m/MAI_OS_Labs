@@ -1,0 +1,113 @@
+\section{Метод решения}
+
+Алгоритм решения задачи:
+
+\begin{enumerate}
+\item Пользователь в консоль родительского процесса вводит имя файла, в который дочерний процесс запишет результат вычислений, а затем — последовательность чисел типа \texttt{float}, разделённых пробелами.
+
+\item Создаётся объект логики родительского процесса (реализован в \texttt{parent.cpp}), инициализирующий работу основной программы.
+
+\item Родительский процесс создаёт объект разделяемой памяти с именем \texttt{/shm} и устанавливает обработчики сигналов \texttt{SIGUSR1} (для получения уведомлений от дочернего процесса) и \texttt{SIGCHLD} (для отслеживания завершения дочернего процесса).
+\item Вызывается \texttt{fork} для создания дочернего процесса.
+\item В контексте дочернего процесса:
+    \begin{itemize}
+    \item Производится подключение к разделяемой памяти по имени \texttt{/shm}.;
+    \item Устанавливается обработчик сигнала \texttt{SIGUSR2} для получения команды от родителя.;
+    \item Отправляется сигнал \texttt{SIGUSR1} родителю, чтобы сообщить, что дочерний процесс готов к работе.;
+    \item Вызывается pause() для ожидания сигнала \texttt{SIGUSR2}.
+    \end{itemize}
+
+\item Родительский процесс ожидает получения сигнала \texttt{SIGUSR1} от дочернего процесса, чтобы убедиться, что обработчик установлен..
+
+\item После получения сигнала \texttt{SIGUSR1}, родитель записывает в разделяемую память введённые пользователем числа.
+
+\item Затем родитель отправляет сигнал \texttt{SIGUSR2} дочернему процессу, чтобы начать вычисления.
+
+\item Дочерний процесс, получив сигнал \texttt{SIGUSR2}, читает числа из разделяемой памяти, выполняет последовательное деление первого числа на все последующие.
+
+\item Перед каждым делением проверяется, не равен ли делитель нулю. В случае деления на ноль процесс немедленно завершается с выводом сообщения об ошибке в \texttt{stderr}.
+\item Если деление выполнено успешно, дочерний процесс открывает (создаёт) указанный файл и записывает в него результат вычислений с точностью до шести знаков после запятой.
+\item После завершения вычислений дочерний процесс отправляет сигнал \texttt{SIGUSR1} родителю, чтобы сообщить об успешном завершении, и завершает свою работу.
+\item Родительский процесс, получив сигнал \texttt{SIGUSR1}, выводит сообщение о том, что результат записан в файл, и завершает работу.
+\end{enumerate}
+
+\vspace{1\baselineskip}
+
+Архитектура программы:
+
+\dirtree{%
+.1 lab3-var4/. 
+.2 bin/. 
+.2 child.cpp.
+.2 build/.
+.2 include/.
+.3 child.h.
+.3 exceptions.h.
+.3 os.h.
+.3 parent.h.
+.2 src/.
+.3 child.cpp.
+.3 os.cpp.
+.3 parent.cpp.
+.2 main.cpp.
+}
+
+Ссылки:
+
+\begin{itemize}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/write.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/execl.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/getppid.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/getpid.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/waitpid.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/sleep.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/exit.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/kill.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/shm_open.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/mmap.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/fork.html}
+\item \url{https://pubs.opengroup.org/onlinepubs/009696799/functions/signal.html}
+\end{itemize}
+vavv
+\section{Описание программы}
+
+\texttt{main.cpp} --- точка входа в родительский процесс. Вызывает функцию \texttt{RunParentProcess()}, реализующую основную логику взаимодействия с пользователем и дочерним процессом.
+
+\texttt{bin/child.cpp} --- Точка входа в дочерний процесс. Принимает имя выходного файла и имя разделяемой памяти как аргументы командной строки и вызывает функцию \texttt{RunChildProcess()} для выполнения вычислений.
+
+\texttt{exceptions.h} --- объявление пользовательских исключений.
+
+\texttt{os.h} --- объявление функций-обёрток над системными вызовами операционной системы (для поддержки кроссплатформенности). \\
+\texttt{src/os.cpp} --- реализация функций. \\
+
+Основные функции:
+\begin{itemize} 
+    \item \texttt{void* CreateSharedMemory(const char* name, size\_t size);} — создаёт разделяемую память. Использует \texttt{shm\_open} и \texttt{mmap}.
+    \item \texttt{int CloseSharedMemory(void* addr, size\_t size);} — отключает разделяемую память. Использует \texttt{munmap}.
+    \item \texttt{int UnlinkSharedMemory(const char* name);} — удаляет разделяемый объект. Использует \texttt{shm\_unlink}.
+    \item \texttt{void SendSignal(pid\_t pid, signal\_t sig);} — отправляет сигнал процессу. Использует \texttt{kill}.
+    \item \texttt{pid\_t CloneProcess();} — создаёт копию текущего процесса. Использует \texttt{fork}.
+    \item \texttt{int Exec(const char* path);} --- заменяет текущий процесс на новый исполняемый файл. Используется системный вызов \texttt{execl()}.
+    \item \texttt{void AddSignalHandler(signal\_t sig, SignalHandler\_t handler);} --- регистрирует обработчик сигнала. Используется системный вызов \texttt{signal()}.
+    \item \texttt{void PrintLastError();} --- выводит описание последней ошибки ОС. Используется функция \texttt{perror()}.
+\end{itemize}
+
+\vspace{1\baselineskip}
+
+\texttt{child.h} --- объявление функции логики дочернего процесса. \\
+\texttt{src/child.cpp} --- реализация вычислительной логики. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{void RunChildProcess(const char* output\_file, const char* shared\_mem\_name);} --- подключается к разделяемой памяти, устанавливает обработчик сигнала, отправляет сигнал готовности родителю, ждёт команду, читает данные, производит вычисления, записывает результат в файл.
+    \item \texttt{static void OnParentSignal(int sig);} — обрабатывает \texttt{SIGUSR2}, читает числа из разделяемой памяти, выполняет деление, записывает результат в файл и отправляет сигнал \texttt{SIGUSR1} родителю.
+\end{itemize}
+
+\vspace{2\baselineskip}
+\texttt{parent.h} --- объявление функции логики родительского процесса. \\
+\texttt{src/parent.cpp} --- реализация управления процессами и взаимодействия с пользователем. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{void RunParentProcess();} --- запрашивает у пользователя имя выходного файла и последовательность чисел, создаёт разделяемую память, устанавливает обработчики сигналов, порождает дочерний процесс через \texttt{fork()}, запускает исполняемый файл \texttt{child}, записывает числа в разделяемую память, отправляет сигнал \texttt{SIGUSR2}, ожидает сигнал \texttt{SIGUSR1} и обрабатывает возможные ошибки.
+    \item \texttt{void OnChildDone(signal\_t signum);} — обработчик сигнала \texttt{SIGUSR1}. Выводит сообщение о завершении работы дочернего процесса.
+    \item \texttt{void OnChildExit(signal\_t signum);} — обработчик сигнала \texttt{SIGCHLD}. Проверяет статус завершения дочернего процесса и при необходимости завершает родительский процесс.
+\end{itemize}
