@@ -1,0 +1,146 @@
+\section{Метод решения}
+
+Алгоритм решения задачи:
+
+\begin{enumerate}
+\item Пользователь вводит команду в консоль одной из тестовых программ:
+    \begin{itemize}
+    \item \texttt{0} - переключение реализаций (только для программы с динамической загрузкой);
+    \item \texttt{1 A B} - вызов функции \texttt{gcf(A, B)} для вычисления НОД;
+    \item \texttt{2 X} - вызов функции \texttt{translation(X)} для перевода числа в другую систему счисления;
+    \end{itemize}
+
+\item Для программы \texttt{main\_link} (и её альтернативной версии \texttt{main\_link\_alt}):
+    \begin{itemize}
+    \item Связывание с динамическими библиотеками происходит на этапе линковки;
+    \item При запуске система автоматически загружает нужные \texttt{.so}-файлы (например, \texttt{libgcf\_euclid.so} и \texttt{libtranslation\_binary.so});
+    \item Вызовы функций \texttt{gcf} и \texttt{translation} разрешаются до начала выполнения основной логики;
+    \end{itemize}
+
+\item Для программы \texttt{main\_runtime}:
+    \begin{itemize}
+    \item На старте создаются объекты класса \texttt{DynamicLibrary}, которые вызывают \texttt{dlopen} для загрузки библиотек \texttt{./libgcf\_euclid.so} и \texttt{./libtranslation\_binary.so};
+    \item Через метод \texttt{get\_function} с использованием \texttt{dlsym} получают указатели на функции \texttt{gcf} и \texttt{translation};
+    \end{itemize}
+
+\item При вводе команды \texttt{0} в \texttt{main\_runtime}:
+    \begin{itemize}
+    \item Текущие библиотеки выгружаются через деструкторы \texttt{DynamicLibrary} (вызывается \texttt{dlclose});
+    \item Загружаются альтернативные реализации: \texttt{./libgcf\_naive.so} и \texttt{./libtranslation\_ternary.so};
+    \item Обновляются указатели на функции, и программа выводит сообщение о переключении.
+    \end{itemize}
+    
+\item При вводе команды \texttt{1 A B}:
+    \begin{itemize}
+    \item Вызывается функция \texttt{gcf(A, B)};
+    \item В зависимости от загруженной библиотеки используется либо алгоритм Евклида, либо наивный перебор;
+    \item Результат выводится в консоль.
+    \end{itemize}
+
+\item При вводе команды \texttt{2 X}:
+    \begin{itemize}
+    \item Вызывается функция \texttt{translation(X)};
+    \item В зависимости от реализации число переводится либо в двоичную, либо в троичную систему счисления.
+    \item Результат (строка, выделенная через \texttt{malloc}) выводится в консоль, после чего освобождается через \texttt{free}.
+    \end{itemize}
+
+\item Все функции экспортируются из библиотек с использованием \texttt{extern "C"}, чтобы избежать \texttt{name mangling} и обеспечить корректную работу \texttt{dlsym}.
+
+\item Память, выделенная в библиотеках (\texttt{malloc}), освобождается в вызывающем коде (\texttt{free}), что гарантирует совместимость аллокаторов между модулями.
+
+\item Обработка ошибок:
+    \begin{itemize}
+    \item При невозможности загрузить библиотеку (ошибка \texttt{dlopen}) выбрасывается исключение \texttt{std::runtime\_error};
+    \item При отсутствии символа (ошибка \texttt{dlsym}) также выбрасывается исключение;
+    \item Программа завершается с информативным сообщением об ошибке.
+    \end{itemize}
+
+\item После завершения работы все динамические библиотеки выгружаются автоматически (благодаря \texttt{RAII}), ресурсы освобождаются, и программа корректно завершает выполнение.
+\end{enumerate}
+
+\vspace{1\baselineskip}
+
+Архитектура программы:
+
+\dirtree{%
+.1 lab4-var25/.  
+.2 build/.
+.2 apps/.
+.3 main\_link.cpp.
+.3 main\_link\_alt.cpp.
+.3 main\_runtime.cpp.
+.2 include/.
+.3 gcf.h.
+.3 translation.h.
+.3 platform/.
+.4 dynlib.h.
+.2 src/.
+.3 gcf\_euclid.cpp.
+.3 gcf\_naive.cpp.
+.3 translation\_binary.cpp.
+.3 translation\_ternary.cpp.
+.3 platform/.
+.4 dynlib.cpp.
+}
+
+Ссылки:
+
+\begin{itemize}
+\item \url{https://pubs.opengroup.org/onlinepubs/9699919799/functions/dlopen.html?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://pubs.opengroup.org/onlinepubs/9699919799/functions/dlsym.html?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://pubs.opengroup.org/onlinepubs/9699919799/functions/dlclose.html?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://man7.org/linux/man-pages/man3/dlopen.3.html?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://www.ibm.com/developerworks/library/l-dynamic-libraries/?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://msdn.microsoft.com/en-us/library/ms235636.aspx?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://msdn.microsoft.com/en-us/library/windows/desktop/ms684175(v=vs.85).aspx?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://msdn.microsoft.com/en-us/library/windows/desktop/ms683212(v=vs.85).aspx?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\item \url{https://gcc.gnu.org/wiki/Visibility?spm=a2ty_o01.29997173.0.0.713351719DZq6l}
+\end{itemize}
+\section{Описание программы}
+
+\texttt{gcf.h, translation.h} --- объявляют функции с \texttt{extern "C"} для экспорта без \texttt{name mangling}.
+
+\texttt{gcf\_euclid.cpp} --— реализует НОД через циклическое деление по модулю. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{int gcf(int a, int b)} —-- вычисляет наибольший общий делитель двух натуральных чисел с использованием классического алгоритма Евклида (через последовательное деление с остатком).
+\end{itemize}
+
+\texttt{gcf\_naive.cpp} --— перебирает все возможные делители от \texttt{min(a,b)} до 1. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{int gcf(int a, int b)} —-- вычисляет НОД путём перебора всех возможных делителей от \texttt{min(a, b)} до 1. Возвращает первый общий делитель, начиная с наибольшего.
+\end{itemize}
+
+\texttt{translation\_binary.cpp} --— использует побитовые операции \texttt{(x \& 1, x >>= 1)} для перевода в двоичную систему. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{char* translation(long x)} —-- преобразует целое число \texttt{x} в строковое представление в двоичной системе счисления. Обрабатывает отрицательные числа и ноль. Память под строку выделяется через \texttt{malloc}.
+\end{itemize}
+
+\texttt{translation\_ternary.cpp} --— использует деление на 3 и остаток от деления для троичного представления. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{char* translation(long x)} — преобразует целое число \texttt{x} в строковое представление в троичной системе счисления. Аналогично поддерживает отрицательные значения и ноль. Использует деление на 3 и запись остатков. Память выделяется через \texttt{malloc}.
+\end{itemize}
+
+\texttt{platform/dynlib.h/cpp} — инкапсулирует \texttt{dlopen}, \texttt{dlsym}, \texttt{dlclose} в \texttt{RAII}-класс \texttt{DynamicLibrary}. \\
+Основные функции:
+\begin{itemize} 
+    \item \texttt{DynamicLibrary::DynamicLibrary(const std::string\& path)} --— загружает динамическую библиотеку по указанному пути. Использует \texttt{dlopen} с флагом \texttt{RTLD\_LAZY}. В случае ошибки выбрасывает исключение.
+    \item \texttt{DynamicLibrary::~DynamicLibrary()} —-- автоматически выгружает библиотеку при уничтожении объекта. Использует \texttt{dlclose}.
+    \item \texttt{void* DynamicLibrary::get\_symbol\_impl(const char* name) const} —-- получает адрес символа (функции или переменной) по его имени из загруженной библиотеки. Использует \texttt{dlsym}. При отсутствии символа выбрасывает исключение.
+    \item \texttt{template<typename Func> Func get\_function(const char* name) const} --— шаблонный метод для безопасного получения указателя на функцию заданной сигнатуры. Выполняет приведение через \texttt{reinterpret\_cast}.
+\end{itemize}
+
+\texttt{main\_link.cpp и main\_link\_alt.cpp} —-- идентичные по коду, различаются только линковкой. \\
+Основные функции:
+\begin{itemize}
+    \item \texttt{main()} —-- реализует цикл ввода команд пользователя и вызов функций \texttt{gcf} и \texttt{translation}. Команда \texttt{0} не поддерживается (выводится соответствующее сообщение). Результаты вычислений выводятся в консоль. Память, полученная от \texttt{translation}, освобождается через \texttt{free}.
+\end{itemize}
+
+\texttt{main\_runtime.cpp} --— загружает библиотеки вручную, поддерживает переключение по команде \texttt{0}. \\
+Основные функции:
+\begin{itemize} 
+    \item \texttt{main()} —-- загружает динамические библиотеки (\texttt{libgcf\_euclid.so} и \texttt{libtranslation\_binary.so}) с помощью обёртки \texttt{DynamicLibrary}.\\Поддерживает команду \texttt{0} для переключения на альтернативные реализации (\texttt{libgcf\_naive.so}, \texttt{libtranslation\_ternary.so}).\\ Обрабатывает команды \texttt{1} и \texttt{2}, вызывая соответствующие функции через указатели, полученные через \texttt{get\_function}.\\Корректно освобождает память через \texttt{free} и обеспечивает безопасную выгрузку библиотек при завершении.
+\end{itemize}
