@@ -1,0 +1,454 @@
+\section{Исходная программа}
+
+\begin{lstlisting}[language=C++,caption=include/gcf.h,captionpos=b]
+#pragma once
+
+extern "C" int gcf(int a, int b);
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=include/translation.h,captionpos=b]
+#pragma once
+
+extern "C" char* translation(long long x);
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=include/platform/dynlib.h,captionpos=b]
+#pragma once
+
+#include <memory>
+#include <string>
+
+namespace platform {
+
+class DynamicLibrary {
+public:
+  explicit DynamicLibrary(const std::string &path);
+  ~DynamicLibrary();
+
+  DynamicLibrary(const DynamicLibrary &) = delete;
+  DynamicLibrary &operator=(const DynamicLibrary &) = delete;
+
+  template <typename Func> Func get_function(const char *name) const {
+    return reinterpret_cast<Func>(get_symbol_impl(name));
+  }
+
+private:
+  void *get_symbol_impl(const char *name) const;
+  void *handle_ = nullptr;
+};
+
+} // namespace platform
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=apps/main\_link.cpp,captionpos=b]
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+#include "gcf.h"
+#include "translation.h"
+
+int main() {
+  std::string cmd;
+  std::cout << "Euclid gcf and binary translation (linking)\n"
+            << "Select mode:\n\t0 - switch libraries (not available in static "
+               "linkage mode)\n"
+            << "\t1 - GCF\n\t2 - translation\n";
+  while (std::cin >> cmd) {
+    if (cmd == "0") {
+      std::cout << "Switch libraries not available in static linkage.\n";
+    } else if (cmd == "1") {
+      std::cout << "Write: A B\n";
+      int a;
+      int b;
+      std::cin >> a >> b;
+      std::cout << "GCF(" << a << ", " << b << ") = " << gcf(a, b) << "\n";
+    } else if (cmd == "2") {
+      std::cout << "Write: X\n";
+      long long x;
+      std::cin >> x;
+      char *res = translation(x);
+      std::cout << "Translation(" << x << ") = " << res << "\n";
+      std::free(res);
+    }
+  }
+  return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=apps/main\_link\_alt.cpp,captionpos=b]
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+#include "gcf.h"
+#include "translation.h"
+
+int main() {
+  std::string cmd;
+  std::cout << "Naive gcf and ternary translation (linking)\n"
+            << "Select mode:\n\t0 - switch libraries (not available in static "
+               "linkage mode)\n"
+            << "\t1 - GCF\n\t2 - translation\n";
+  while (std::cin >> cmd) {
+    if (cmd == "0") {
+      std::cout << "Switch libraries not available in static linkage.\n";
+    } else if (cmd == "1") {
+      std::cout << "Write: A B\n";
+      int a;
+      int b;
+      std::cin >> a >> b;
+      std::cout << "GCF(" << a << ", " << b << ") = " << gcf(a, b) << "\n";
+    } else if (cmd == "2") {
+      std::cout << "Write: X\n";
+      long long x;
+      std::cin >> x;
+      char *res = translation(x);
+      std::cout << "Translation(" << x << ") = " << res << "\n";
+      std::free(res);
+    }
+  }
+  return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=apps/main\_runtime.cpp,captionpos=b]
+#include <iostream>
+#include <memory>
+#include <string>
+
+#include "platform/dynlib.h"
+
+using gcf_func_t = int (*)(int, int);
+using translation_func_t = char *(*)(long long);
+
+int main() {
+  std::string gcf_path = "./libgcf_euclid.so";
+  std::string trans_path = "./libtranslation_binary.so";
+
+  std::unique_ptr<platform::DynamicLibrary> gcf_lib;
+  std::unique_ptr<platform::DynamicLibrary> trans_lib;
+
+  try {
+    gcf_lib = std::make_unique<platform::DynamicLibrary>(gcf_path);
+    trans_lib = std::make_unique<platform::DynamicLibrary>(trans_path);
+  } catch (const std::exception &e) {
+    std::cerr << "Error: " << e.what() << "\n";
+    return 1;
+  }
+
+  auto gcf_func = gcf_lib->get_function<gcf_func_t>("gcf");
+  auto trans_func = trans_lib->get_function<translation_func_t>("translation");
+
+  std::cout << "Euclid gcf and binary translation (runtime)\n"
+            << "Select mode:\n\t0 - switch libraries\n"
+            << "\t1 - GCF\n\t2 - translation\n";
+  std::string cmd;
+  while (std::cin >> cmd) {
+    if (cmd == "0") {
+      if (gcf_path == "./libgcf_euclid.so") {
+        gcf_path = "./libgcf_naive.so";
+        trans_path = "./libtranslation_ternary.so";
+      } else {
+        gcf_path = "./libgcf_euclid.so";
+        trans_path = "./libtranslation_binary.so";
+      }
+
+      try {
+        gcf_lib = std::make_unique<platform::DynamicLibrary>(gcf_path);
+        trans_lib = std::make_unique<platform::DynamicLibrary>(trans_path);
+
+        gcf_func = gcf_lib->get_function<gcf_func_t>("gcf");
+        trans_func = trans_lib->get_function<translation_func_t>("translation");
+        std::cout << "Switched to alternative.\n";
+      } catch (const std::exception &e) {
+        std::cerr << "Switch failed: " << e.what() << "\n";
+      }
+    } else if (cmd == "1") {
+      std::cout << "Write: A B\n";
+      int a;
+      int b;
+      std::cin >> a >> b;
+      std::cout << "GCF(" << a << ", " << b << ") = " << gcf_func(a, b) << "\n";
+    } else if (cmd == "2") {
+      std::cout << "Write: X\n";
+      long long x;
+      std::cin >> x;
+      char *res = trans_func(x);
+      std::cout << "Translation(" << x << ") = " << res << "\n";
+      std::free(res);
+    }
+  }
+
+  return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/gcf\_euclid.cpp,captionpos=b]
+#include "gcf.h"
+
+int gcf(int a, int b) {
+  while (b != 0) {
+    int temp = b;
+    b = a % b;
+    a = temp;
+  }
+  return a;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/gcf\_naive.cpp,captionpos=b]
+#include <algorithm>
+
+#include "gcf.h"
+
+int gcf(int a, int b) {
+  int min_value = std::min(a, b);
+  for (int i = min_value; i >= 1; --i) {
+    if (a % i == 0 && b % i == 0)
+      return i;
+  }
+  return 1;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/translation\_binary.cpp,captionpos=b]
+#include <cstdlib>
+#include <cstring>
+
+#include "translation.h"
+
+const int8_t BUFFER = 65;
+
+char *translation(long long x) {
+  if (x == 0) {
+    char *res = static_cast<char *>(malloc(2));
+    std::strcpy(res, "0");
+    return res;
+  }
+
+  bool neg = x < 0;
+  if (neg)
+    x = -x;
+
+  char buffer[BUFFER];
+  int i = 0;
+  while (x > 0) {
+    buffer[i++] = '0' + (x & 1);
+    x >>= 1;
+  }
+  if (neg)
+    buffer[i++] = '-';
+
+  char *result = static_cast<char *>(malloc(i + 1));
+  for (int j = 0; j < i; ++j) {
+    result[j] = buffer[i - 1 - j];
+  }
+  result[i] = '\0';
+  return result;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/translation\_ternary.cpp,captionpos=b]
+#include "translation.h"
+
+#include <cstdlib>
+#include <cstring>
+
+const int8_t BUFFER = 65;
+
+char *translation(long long x) {
+  if (x == 0) {
+    char *res = static_cast<char *>(malloc(2));
+    std::strcpy(res, "0");
+    return res;
+  }
+
+  bool neg = x < 0;
+  if (neg)
+    x = -x;
+
+  char buffer[BUFFER];
+  int i = 0;
+  while (x > 0) {
+    buffer[i++] = '0' + (x % 3);
+    x /= 3;
+  }
+  if (neg)
+    buffer[i++] = '-';
+
+  char *result = static_cast<char *>(malloc(i + 1));
+  for (int j = 0; j < i; ++j) {
+    result[j] = buffer[i - 1 - j];
+  }
+  result[i] = '\0';
+  return result;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/platform/dynlib.cpp,captionpos=b]
+#include "platform/dynlib.h"
+
+#include <dlfcn.h>
+#include <stdexcept>
+#include <string>
+
+namespace platform {
+
+DynamicLibrary::DynamicLibrary(const std::string &path)
+    : handle_(dlopen(path.c_str(), RTLD_LAZY)) {
+  if (!handle_) {
+    throw std::runtime_error("Failed to load library: " + path);
+  }
+}
+
+DynamicLibrary::~DynamicLibrary() {
+  if (handle_) {
+    dlclose(handle_);
+  }
+}
+
+void *DynamicLibrary::get_symbol_impl(const char *name) const {
+  void *symbol = dlsym(handle_, name);
+  if (!symbol) {
+    throw std::runtime_error("Symbol not found: " + std::string(name));
+  }
+  return symbol;
+}
+
+} // namespace platform
+\end{lstlisting}
+\section{Strace}
+\begin{verbatim}
+execve("./main_runtime", ["./main_runtime"], 0x7ffc4db5f420 /* 27 vars */) = 0
+brk(NULL)                               = 0x578834a10000
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x70b06d051000
+readlinkat(AT_FDCWD, "/proc/self/exe", "/home/yamaksush/MAI_OS_Labs/lab4"..., 4096) = 57
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/glibc-hwcaps/x86-64-v3/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+newfstatat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/glibc-hwcaps/x86-64-v3/", 0x7ffeb6f006c0, 0) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/glibc-hwcaps/x86-64-v2/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+newfstatat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/glibc-hwcaps/x86-64-v2/", 0x7ffeb6f006c0, 0) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+newfstatat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+fstat(3, {st_mode=S_IFREG|0644, st_size=20919, ...}) = 0
+mmap(NULL, 20919, PROT_READ, MAP_PRIVATE, 3, 0) = 0x70b06d04b000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0644, st_size=2592224, ...}) = 0
+mmap(NULL, 2609472, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06cc00000
+mmap(0x70b06cc9d000, 1343488, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x9d000) = 0x70b06cc9d000
+mmap(0x70b06cde5000, 552960, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1e5000) = 0x70b06cde5000
+mmap(0x70b06ce6c000, 57344, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x26b000) = 0x70b06ce6c000
+mmap(0x70b06ce7a000, 12608, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x70b06ce7a000
+close(3)                                = 0
+openat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0644, st_size=183024, ...}) = 0
+mmap(NULL, 185256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06d01d000
+mmap(0x70b06d021000, 147456, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x4000) = 0x70b06d021000
+mmap(0x70b06d045000, 16384, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x70b06d045000
+mmap(0x70b06d049000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2b000) = 0x70b06d049000
+close(3)                                = 0
+openat(AT_FDCWD, "/home/yamaksush/MAI_OS_Labs/lab4-var25/build/libc.so.6", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\220\243\2\0\0\0\0\0"..., 832) = 832
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+fstat(3, {st_mode=S_IFREG|0755, st_size=2125328, ...}) = 0
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+mmap(NULL, 2170256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06c800000
+mmap(0x70b06c828000, 1605632, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x70b06c828000
+mmap(0x70b06c9b0000, 323584, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1b0000) = 0x70b06c9b0000
+mmap(0x70b06c9ff000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1fe000) = 0x70b06c9ff000
+mmap(0x70b06ca05000, 52624, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x70b06ca05000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libm.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0644, st_size=952616, ...}) = 0
+mmap(NULL, 950296, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06cf34000
+mmap(0x70b06cf44000, 520192, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x10000) = 0x70b06cf44000
+mmap(0x70b06cfc3000, 360448, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x8f000) = 0x70b06cfc3000
+mmap(0x70b06d01b000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xe7000) = 0x70b06d01b000
+close(3)                                = 0
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x70b06cf32000
+mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x70b06cf2f000
+arch_prctl(ARCH_SET_FS, 0x70b06cf2f740) = 0
+set_tid_address(0x70b06cf2fa10)         = 44615
+set_robust_list(0x70b06cf2fa20, 24)     = 0
+rseq(0x70b06cf30060, 0x20, 0, 0x53053053) = 0
+mprotect(0x70b06c9ff000, 16384, PROT_READ) = 0
+mprotect(0x70b06d01b000, 4096, PROT_READ) = 0
+mprotect(0x70b06d049000, 4096, PROT_READ) = 0
+mprotect(0x70b06ce6c000, 45056, PROT_READ) = 0
+mprotect(0x57881da92000, 4096, PROT_READ) = 0
+mprotect(0x70b06d089000, 8192, PROT_READ) = 0
+prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+munmap(0x70b06d04b000, 20919)           = 0
+futex(0x70b06ce7a7bc, FUTEX_WAKE_PRIVATE, 2147483647) = 0
+getrandom("\xc4\xe1\x1f\xa1\x2d\x9f\x7a\xe8", 8, GRND_NONBLOCK) = 8
+brk(NULL)                               = 0x578834a10000
+brk(0x578834a31000)                     = 0x578834a31000
+openat(AT_FDCWD, "./libgcf_euclid.so", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=15112, ...}) = 0
+getcwd("/home/yamaksush/MAI_OS_Labs/lab4-var25/build", 128) = 45
+mmap(NULL, 16400, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06d04c000
+mmap(0x70b06d04d000, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1000) = 0x70b06d04d000
+mmap(0x70b06d04e000, 4096, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06d04e000
+mmap(0x70b06d04f000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06d04f000
+close(3)                                = 0
+mprotect(0x70b06d04f000, 4096, PROT_READ) = 0
+openat(AT_FDCWD, "./libtranslation_binary.so", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=15664, ...}) = 0
+getcwd("/home/yamaksush/MAI_OS_Labs/lab4-var25/build", 128) = 45
+mmap(NULL, 16416, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06cf2a000
+mmap(0x70b06cf2b000, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1000) = 0x70b06cf2b000
+mmap(0x70b06cf2c000, 4096, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06cf2c000
+mmap(0x70b06cf2d000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06cf2d000
+close(3)                                = 0
+mprotect(0x70b06cf2d000, 4096, PROT_READ) = 0
+fstat(1, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}) = 0
+write(1, "Euclid gcf and binary translatio"..., 44) = 44
+write(1, "Select mode:\n\t0 - switch librari"..., 35) = 35
+write(1, "\t1 - GCF\n\t2 - translation\n", 26) = 26
+fstat(0, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}) = 0
+read(0, "0\n", 1024)                    = 2
+openat(AT_FDCWD, "./libgcf_naive.so", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=15312, ...}) = 0
+getcwd("/home/yamaksush/MAI_OS_Labs/lab4-var25/build", 128) = 45
+mmap(NULL, 16408, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06cf25000
+mmap(0x70b06cf26000, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1000) = 0x70b06cf26000
+mmap(0x70b06cf27000, 4096, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06cf27000
+mmap(0x70b06cf28000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06cf28000
+close(3)                                = 0
+mprotect(0x70b06cf28000, 4096, PROT_READ) = 0
+munmap(0x70b06d04c000, 16400)           = 0
+openat(AT_FDCWD, "./libtranslation_ternary.so", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+fstat(3, {st_mode=S_IFREG|0755, st_size=15664, ...}) = 0
+getcwd("/home/yamaksush/MAI_OS_Labs/lab4-var25/build", 128) = 45
+mmap(NULL, 16416, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x70b06d04c000
+mmap(0x70b06d04d000, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1000) = 0x70b06d04d000
+mmap(0x70b06d04e000, 4096, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06d04e000
+mmap(0x70b06d04f000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2000) = 0x70b06d04f000
+close(3)                                = 0
+mprotect(0x70b06d04f000, 4096, PROT_READ) = 0
+munmap(0x70b06cf2a000, 16416)           = 0
+write(1, "Switched to alternative.\n", 25) = 25
+read(0, "1\n", 1024)                    = 2
+write(1, "Write: A B\n", 11)            = 11
+read(0, "10 6\n", 1024)                 = 5
+write(1, "GCF(10, 6) = 2\n", 15)        = 15
+read(0, "2\n", 1024)                    = 2
+write(1, "Write: X\n", 9)               = 9
+read(0, "48\n", 1024)                   = 3
+write(1, "Translation(48) = 1210\n", 23) = 23
+read(0, 0x578834a24600, 1024)           = ? ERESTARTSYS (To be restarted if SA_RESTART is set)
+--- SIGINT {si_signo=SIGINT, si_code=SI_KERNEL} ---
++++ killed by SIGINT +++
+\end{verbatim}
