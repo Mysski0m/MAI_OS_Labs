@@ -1,7 +1,7 @@
 #include "ClientApp.h"
 
 int main() {
-    ClientApp client;
-    client.start();
-    return 0;
+  ClientApp client;
+  client.start();
+  return 0;
 }

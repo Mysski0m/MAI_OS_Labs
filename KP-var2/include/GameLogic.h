@@ -1,38 +1,27 @@
 #pragma once
 
-#include <vector>
-#include <ctime>
 #include <cstdlib>
+#include <ctime>
+#include <vector>
 
-enum CellState {
-    EMPTY = 0,
-    SHIP = 1,
-    MISS = 2,
-    HIT = 3
-};
+enum CellState { EMPTY = 0, SHIP = 1, MISS = 2, HIT = 3 };
 
-enum ShotResult {
-    RES_MISS,
-    RES_HIT,
-    RES_SUNK,
-    RES_REPEAT,
-    RES_LOSE
-};
+enum ShotResult { RES_MISS, RES_HIT, RES_SUNK, RES_REPEAT, RES_LOSE };
 
 class GameBoard {
 public:
-    GameBoard();
+  GameBoard();
 
-    void placeShipsRandomly();
+  void placeShipsRandomly();
 
-    ShotResult processShot(int x, int y);
+  ShotResult processShot(int x, int y);
 
-    int getCell(int x, int y) const { return grid[y][x]; }
+  int getCell(int x, int y) const { return grid[y][x]; }
 
-    void getBoardString(char* buffer, bool showShips);
+  void getBoardString(char *buffer, bool showShips);
 
 private:
-    static const int SIZE = 10;
-    int grid[SIZE][SIZE];
-    int shipsAlive;
+  static const int SIZE = 10;
+  int grid[SIZE][SIZE];
+  int shipsAlive;
 };
