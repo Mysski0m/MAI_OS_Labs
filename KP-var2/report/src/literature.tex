@@ -1,0 +1,1832 @@
+\section{Исходная программа}
+
+\begin{lstlisting}[language=C++,caption=include/ClientApp.h,captionpos=b]
+#pragma once
+
+#include "protocol.h"
+#include "wrappers.h"
+
+#include <pthread.h>
+#include <string>
+
+class ClientApp {
+public:
+  ClientApp();
+  ~ClientApp() = default;
+  void start();
+
+private:
+  std::string login;
+  bool isRunning;
+  pthread_t listenerThread;
+
+  static void *listenThreadWrapper(void *context);
+  void listenLoop();
+
+  void sendPacket(Packet &pkt);
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=include/GameLogic.h,captionpos=b]
+#pragma once
+
+#include <cstdlib>
+#include <ctime>
+#include <vector>
+
+enum CellState { EMPTY = 0, SHIP = 1, MISS = 2, HIT = 3 };
+
+enum ShotResult { RES_MISS, RES_HIT, RES_SUNK, RES_REPEAT, RES_LOSE };
+
+class GameBoard {
+public:
+  GameBoard();
+
+  void placeShipsRandomly();
+
+  ShotResult processShot(int x, int y);
+
+  int getCell(int x, int y) const { return grid[y][x]; }
+
+  void getBoardString(char *buffer, bool showShips);
+
+private:
+  static const int SIZE = 10;
+  int grid[SIZE][SIZE];
+  int shipsAlive;
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=include/ServerApp.h,captionpos=b]
+#pragma once
+
+#include "protocol.h"
+#include "wrappers.h"
+
+#include <pthread.h>
+#include <string>
+#include <vector>
+
+class ServerApp {
+public:
+  ServerApp();
+  ~ServerApp();
+  void run();
+
+private:
+  std::vector<Player> players;
+  pthread_mutex_t list_mutex;
+  NamedPipe serverPipe;
+  bool isRunning;
+
+  Player *findPlayer(const std::string &login);
+  void sendToClient(const std::string &login, Packet &pkt);
+  void sendBoard(Player *pTarget, GameBoard &boardOwner, bool showShips,
+                 const char *title);
+
+  void handleLogin(Packet &pkt);
+  void handleInvite(Packet &pkt);
+  void handleInviteResponse(Packet &pkt);
+  void hanldeShoot(Packet &pkt);
+  void handleLogout(Packet &pkt);
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=include/protocol.h,captionpos=b]
+#pragma once
+
+#include "GameLogic.h"
+
+#include <string>
+
+#define SERVER_PIPE "/tmp/battleship_server_pipe"
+#define CLIENT_PIPE_PREFIX "/tmp/client_"
+
+enum MsgType {
+  LOGIN,
+  INVITE,
+  INVITE_RESPONSE,
+  SHOOT,
+  LOGOUT,
+  S_MSG,
+  S_INVITE,
+  S_GAME_START,
+  S_SHOT_RESULT,
+  S_GAME_OVER,
+  S_BOARD
+};
+
+struct Packet {
+  int type;
+  char sender[32];
+  char target[32];
+  char payload[512];
+  int x;
+  int y;
+  int shotResult;
+};
+
+struct Player {
+  std::string login;
+  bool inGame;
+  std::string opponent;
+  GameBoard board;
+  bool isTurn;
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=include/wrappers.h,captionpos=b]
+#pragma once
+
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <iostream>
+#include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+class NamedPipe {
+public:
+  std::string path;
+  int fd;
+
+  NamedPipe(std::string _path) : path(_path), fd(-1) {}
+
+  bool create() {
+    if (mkfifo(path.c_str(), 0666) == -1) {
+      if (errno != EEXIST) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void removePipe() { unlink(path.c_str()); }
+
+  bool openPipe(int mode) {
+    fd = open(path.c_str(), mode);
+    return (fd != -1);
+  }
+
+  void closePipe() {
+    if (fd != -1) {
+      close(fd);
+      fd = -1;
+    }
+  }
+
+  bool send(const void *buffer, size_t size) {
+    if (fd == -1)
+      return false;
+    return write(fd, buffer, size) == (ssize_t)size;
+  }
+
+  bool receive(void *buffer, size_t size) {
+    if (fd == -1)
+      return false;
+    return read(fd, buffer, size) == (ssize_t)size;
+  }
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/client/ClientApp.cpp,captionpos=b]
+#include "ClientApp.h"
+
+#include <cstring>
+#include <iostream>
+#include <unistd.h>
+
+ClientApp::ClientApp() : isRunning(true) {}
+
+void *ClientApp::listenThreadWrapper(void *context) {
+  ((ClientApp *)context)->listenLoop();
+  return nullptr;
+}
+
+void ClientApp::listenLoop() {
+  std::string pipePath = CLIENT_PIPE_PREFIX + login;
+  NamedPipe myPipe(pipePath);
+
+  myPipe.removePipe();
+  if (!myPipe.create() || !myPipe.openPipe(O_RDWR)) {
+    std::cerr << "\n[Error] Could not create a personal channel to receive "
+                 "messages.\n";
+    return;
+  }
+
+  Packet pkt;
+  while (isRunning) {
+    if (myPipe.receive(&pkt, sizeof(Packet))) {
+      switch (pkt.type) {
+      case S_MSG:
+        std::cout << "\n[SERVER]: " << pkt.payload << "\n" << std::flush;
+        break;
+      case S_INVITE:
+        std::cout << "\n[INVITE]: Invite from " << pkt.sender
+                  << ". Enter '/accept " << pkt.sender << "'\n"
+                  << std::flush;
+        break;
+      case S_GAME_START:
+        std::cout << "\n[GAME]: GAME HAS BEEN STARTED! Opponent: "
+                  << pkt.payload
+                  << "\n[GAME]: Your ships are automatically spaced."
+                  << "\n[GAME]: Enter '/shoot X Y' (0-9)\n"
+                  << std::flush;
+        break;
+      case S_BOARD:
+        std::cout << "\n" << pkt.payload << "\n>" << std::flush;
+        break;
+      case S_SHOT_RESULT:
+        std::cout << "\n[RESULT]: " << pkt.payload << " (" << pkt.x << ", "
+                  << pkt.y << ")\n>" << std::flush;
+        break;
+      case S_GAME_OVER:
+        std::cout << "\n\n====================================\n";
+        std::cout << "               GAME OVER                \n";
+        std::cout << "=======================================\n";
+        std::cout << pkt.payload << "\n";
+        std::cout << "=======================================\n";
+        std::cout << "You are in main menu\n";
+        std::cout << "Commands:\n";
+        std::cout << "  /invite <login>  - Invite player\n";
+        std::cout << "  /accept <login>  - Accept invite\n";
+        std::cout << "  /shoot <x> <y>   - Shot (0-9)\n";
+        std::cout << "  /quit            - Quit\n";
+        std::cout << "> " << std::flush;
+        break;
+      }
+    }
+  }
+  myPipe.closePipe();
+  myPipe.removePipe();
+}
+
+void ClientApp::sendPacket(Packet &pkt) {
+  NamedPipe serverPipe(SERVER_PIPE);
+  if (serverPipe.openPipe(O_WRONLY)) {
+    serverPipe.send(&pkt, sizeof(Packet));
+    serverPipe.closePipe();
+  } else {
+    std::cout << "[Error] Server not available (not running).\n";
+  }
+}
+
+void ClientApp::start() {
+  std::cout << "=== SEA FIGHT CLIENT ===\n";
+  std::cout << "Enter your login: ";
+  std::cin >> login;
+
+  if (pthread_create(&listenerThread, NULL, listenThreadWrapper, this) != 0) {
+    std::cerr << "Error of creating the thread.\n";
+    return;
+  }
+  sleep(1);
+
+  Packet auth;
+  auth.type = LOGIN;
+  strcpy(auth.sender, login.c_str());
+  sendPacket(auth);
+
+  std::cout << "Commands:\n";
+  std::cout << "  /invite <login>  - Invite player\n";
+  std::cout << "  /accept <login>  - Accept invite\n";
+  std::cout << "  /shoot <x> <y>   - Shot (0-9)\n";
+  std::cout << "  /quit            - Quit\n";
+  std::cout << "> ";
+
+  std::string cmd;
+  while (isRunning) {
+    std::cin >> cmd;
+    Packet pkt;
+    memset(&pkt, 0, sizeof(Packet));
+    pkt.type = -1;
+    strcpy(pkt.sender, login.c_str());
+
+    if (cmd == "/quit") {
+      pkt.type = LOGOUT;
+      sendPacket(pkt);
+      isRunning = false;
+    } else if (cmd == "/invite") {
+      std::string target;
+      std::cin >> target;
+      pkt.type = INVITE;
+      strcpy(pkt.target, target.c_str());
+      sendPacket(pkt);
+    } else if (cmd == "/accept") {
+      std::string target;
+      std::cin >> target;
+      pkt.type = INVITE_RESPONSE;
+      strcpy(pkt.target, target.c_str());
+      pkt.payload[0] = 'Y';
+      sendPacket(pkt);
+    } else if (cmd == "/shoot") {
+      std::cin >> pkt.x >> pkt.y;
+      pkt.type = SHOOT;
+      sendPacket(pkt);
+    } else {
+      std::cout << "Invalid command.\n";
+    }
+  }
+
+  pthread_cancel(listenerThread);
+  pthread_join(listenerThread, NULL);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/client/client\_main.cpp,captionpos=b]
+#include "ClientApp.h"
+
+int main() {
+  ClientApp client;
+  client.start();
+  return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/game/GameLogic.cpp,captionpos=b]
+#include "GameLogic.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+
+GameBoard::GameBoard() {
+  shipsAlive = 0;
+  for (int i = 0; i < SIZE; ++i) {
+    for (int j = 0; j < SIZE; ++j) {
+      grid[i][j] = EMPTY;
+    }
+  }
+}
+
+void GameBoard::placeShipsRandomly() {
+  static const int BATTLESHIP = 4;
+  static const int CRUISER = 3;
+  static const int DESTROYER = 2;
+  static const int SUBMARINE = 1;
+
+  for (int i = 0; i < SIZE; ++i) {
+    for (int j = 0; j < SIZE; ++j) {
+      grid[i][j] = EMPTY;
+    }
+  }
+  shipsAlive = 0;
+
+  int ships[] = {BATTLESHIP, CRUISER,   CRUISER,   DESTROYER, DESTROYER,
+                 DESTROYER,  SUBMARINE, SUBMARINE, SUBMARINE, SUBMARINE};
+
+  for (int len : ships) {
+    bool placed = false;
+    while (!placed) {
+      int row = std::rand() % SIZE;
+      int col = std::rand() % SIZE;
+      bool horizontal = std::rand() % 2;
+
+      bool canPlace = true;
+      for (int k = 0; k < len; ++k) {
+        int nrow = row + (horizontal ? 0 : k);
+        int ncol = col + (horizontal ? k : 0);
+
+        if (nrow >= SIZE || ncol >= SIZE || grid[nrow][ncol] != EMPTY) {
+          canPlace = false;
+          break;
+        }
+      }
+
+      if (canPlace) {
+        for (int k = 0; k < len; ++k) {
+          int nrow = row + (horizontal ? 0 : k);
+          int ncol = col + (horizontal ? k : 0);
+          grid[nrow][ncol] = SHIP;
+          shipsAlive++;
+        }
+        placed = true;
+      }
+    }
+  }
+}
+
+ShotResult GameBoard::processShot(int x, int y) {
+  if (x < 0 || x >= SIZE || y < 0 || y >= SIZE)
+    return RES_REPEAT;
+
+  int &cell = grid[y][x];
+
+  if (cell == MISS || cell == HIT)
+    return RES_REPEAT;
+
+  if (cell == EMPTY) {
+    cell = MISS;
+    return RES_MISS;
+  }
+
+  if (cell == SHIP) {
+    cell = HIT;
+    shipsAlive--;
+    if (shipsAlive <= 0)
+      return RES_LOSE;
+    return RES_HIT;
+  }
+
+  return RES_REPEAT;
+}
+
+void GameBoard::getBoardString(char *buffer, bool showShips) {
+  int pos = 0;
+
+  pos += sprintf(buffer + pos, "  0 1 2 3 4 5 6 7 8 9\n");
+  pos += sprintf(buffer + pos, " ---------------------\n");
+
+  for (int i = 0; i < SIZE; ++i) {
+    pos += sprintf(buffer + pos, "%d ", i);
+    for (int j = 0; j < SIZE; ++j) {
+      char symbol = '.';
+      int cell = grid[i][j];
+
+      if (cell == EMPTY) {
+        symbol = '.';
+      } else if (cell == SHIP) {
+        symbol = showShips ? '#' : '.';
+      } else if (cell == MISS) {
+        symbol = '*';
+      } else if (cell == HIT) {
+        symbol = 'X';
+      }
+      pos += sprintf(buffer + pos, "%c ", symbol);
+    }
+    pos += sprintf(buffer + pos, "\n");
+  }
+  buffer[pos] = '\0';
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/server/ServerApp.cpp,captionpos=b]
+#include "ServerApp.h"
+
+#include <algorithm>
+#include <cstring>
+#include <iostream>
+
+ServerApp::ServerApp() : serverPipe(SERVER_PIPE), isRunning(true) {
+  list_mutex = PTHREAD_MUTEX_INITIALIZER;
+}
+
+ServerApp::~ServerApp() { pthread_mutex_destroy(&list_mutex); }
+
+void ServerApp::sendToClient(const std::string &login, Packet &pkt) {
+  std::string pipePath = CLIENT_PIPE_PREFIX + login;
+  NamedPipe pipe(pipePath);
+  if (pipe.openPipe(O_WRONLY)) {
+    pipe.send(&pkt, sizeof(Packet));
+    pipe.closePipe();
+  } else {
+    std::cerr << "[Error] Failed to send message to player " << login
+              << " (pipe is not available)\n";
+  }
+}
+
+void ServerApp::sendBoard(Player *pTarget, GameBoard &boardOwner,
+                          bool showShips, const char *title) {
+  Packet pkt;
+  pkt.type = S_BOARD;
+  strcpy(pkt.sender, "SERVER");
+
+  char boardStr[400];
+  boardOwner.getBoardString(boardStr, showShips);
+
+  sprintf(pkt.payload, "%s\n%s", title, boardStr);
+  sendToClient(pTarget->login, pkt);
+}
+
+Player *ServerApp::findPlayer(const std::string &login) {
+  for (auto &p : players) {
+    if (p.login == login)
+      return &p;
+  }
+  return nullptr;
+}
+
+void ServerApp::handleLogin(Packet &pkt) {
+  if (findPlayer(pkt.sender)) {
+    std::cout << "[Login] Reject: " << pkt.sender << " is already online."
+              << std::endl;
+    return;
+  }
+  players.push_back({pkt.sender, false, "", GameBoard()});
+  std::cout << "[Login] New player: " << pkt.sender << std::endl;
+
+  Packet resp;
+  resp.type = S_MSG;
+  strcpy(resp.payload, "Welcome to the Sea Fight server!");
+  sendToClient(pkt.sender, resp);
+}
+
+void ServerApp::handleInvite(Packet &pkt) {
+  Player *target = findPlayer(pkt.target);
+  if (target && target->login != pkt.sender && !target->inGame) {
+    Packet invitePkt;
+    invitePkt.type = S_INVITE;
+    strcpy(invitePkt.sender, pkt.sender);
+    sendToClient(pkt.target, invitePkt);
+
+    Packet confirmPkt;
+    confirmPkt.type = S_MSG;
+    char buffer[128];
+    sprintf(buffer, "Invite received to player %s! Wait for answer...",
+            pkt.target);
+    strcpy(confirmPkt.payload, buffer);
+    sendToClient(pkt.sender, confirmPkt);
+
+    std::cout << "[Invite] " << pkt.sender << " -> " << pkt.target << std::endl;
+  } else {
+    Packet err;
+    err.type = S_MSG;
+    strcpy(err.payload, "Player not found or already playing.");
+    sendToClient(pkt.sender, err);
+  }
+}
+
+void ServerApp::handleInviteResponse(Packet &pkt) {
+  if (pkt.payload[0] == 'Y' || pkt.payload[0] == 'y') {
+    Player *sender = findPlayer(pkt.sender);
+    Player *opponent = findPlayer(pkt.target);
+
+    if (sender && opponent) {
+      sender->inGame = true;
+      sender->opponent = opponent->login;
+      sender->board.placeShipsRandomly();
+      sender->isTurn = false;
+
+      opponent->inGame = true;
+      opponent->opponent = sender->login;
+      opponent->board.placeShipsRandomly();
+      opponent->isTurn = true;
+
+      Packet start;
+      start.type = S_GAME_START;
+
+      strcpy(start.payload, opponent->login.c_str());
+      strcat(start.payload, " (Wait for opponent turn)");
+      sendToClient(sender->login, start);
+
+      strcpy(start.payload, sender->login.c_str());
+      strcat(start.payload, " (YOUR TURN)");
+      sendToClient(opponent->login, start);
+
+      sendBoard(sender, sender->board, true, "YOUR BOARD:");
+      sendBoard(opponent, opponent->board, true, "YOUR BOARD:");
+
+      std::cout << "[Game Start] " << sender->login << " vs " << opponent->login
+                << std::endl;
+    }
+  }
+}
+
+void ServerApp::hanldeShoot(Packet &pkt) {
+  Player *shooter = findPlayer(pkt.sender);
+
+  if (!shooter) {
+    std::cout << "Shooter not found: " << pkt.sender << "\n";
+    return;
+  }
+  if (!shooter->inGame) {
+    std::cout << "Shooter not in game: " << pkt.sender << "\n";
+    return;
+  }
+  if (shooter->opponent.empty()) {
+    std::cout << "Opponent string empty for " << pkt.sender << "\n";
+    return;
+  }
+
+  if (!shooter->isTurn) {
+    Packet err;
+    err.type = S_MSG;
+    strcpy(err.payload, "Now is NOT your turn. Wait for opponent.");
+    sendToClient(shooter->login, err);
+    return;
+  }
+
+  Player *victim = findPlayer(shooter->opponent);
+  if (!victim) {
+    std::cout << "Victim not found: " << shooter->opponent << "\n";
+    return;
+  }
+
+  ShotResult res = victim->board.processShot(pkt.x, pkt.y);
+
+  if (res == RES_REPEAT) {
+    Packet err;
+    err.type = S_MSG;
+    strcpy(err.payload,
+           "You have already shot here or the coordinates are wrong. Repeat.");
+    sendToClient(shooter->login, err);
+    return;
+  }
+
+  std::cout << "[Shoot] " << shooter->login << " at (" << pkt.x << ", " << pkt.y
+            << ")" << std::endl;
+
+  if (res == RES_LOSE) {
+    Packet pktWin;
+    pktWin.type = S_GAME_OVER;
+    strcpy(pktWin.payload, "WIN! You destroy all opponent's ships\n");
+    sendToClient(shooter->login, pktWin);
+
+    Packet pktLose;
+    pktLose.type = S_GAME_OVER;
+    strcpy(pktLose.payload, "LOSE! Your ships destroyed\n");
+    sendToClient(victim->login, pktLose);
+
+    shooter->inGame = false;
+    shooter->opponent = "";
+    shooter->isTurn = false;
+
+    victim->inGame = false;
+    victim->opponent = "";
+    victim->isTurn = false;
+
+    std::cout << "[Game Over] Winner:" << shooter->login << "\n";
+    return;
+  }
+
+  Packet respShooter;
+  respShooter.type = S_SHOT_RESULT;
+  respShooter.x = pkt.x;
+  respShooter.y = pkt.y;
+  respShooter.shotResult = (int)res;
+
+  if (res == RES_HIT) {
+    strcpy(respShooter.payload, "HIT! Shoot again!");
+  } else {
+    strcpy(respShooter.payload, "MISS. Change turn...");
+  }
+
+  sendToClient(shooter->login, respShooter);
+
+  sendBoard(shooter, victim->board, false, "Opponent's board (Radar):");
+
+  Packet respVictim = respShooter;
+  if (res == RES_HIT) {
+    strcpy(respVictim.payload, "Your ship has been HIT! Opponent's turn...");
+  } else {
+    strcpy(respVictim.payload, "Opponent MISS! Your turn!");
+  }
+
+  sendToClient(victim->login, respVictim);
+
+  sendBoard(victim, victim->board, true, "Your board:");
+
+  if (res == RES_MISS) {
+    shooter->isTurn = false;
+    victim->isTurn = true;
+  }
+}
+
+void ServerApp::handleLogout(Packet &pkt) {
+  Player *quittingPlayer = findPlayer(pkt.sender);
+
+  if (quittingPlayer && quittingPlayer->inGame) {
+    Player *opponent = findPlayer(quittingPlayer->opponent);
+    if (opponent) {
+      Packet winPkt;
+      winPkt.type = S_GAME_OVER;
+      strcpy(winPkt.payload, "Opponent left the game.\n YOU WON!");
+      sendToClient(opponent->login, winPkt);
+
+      opponent->inGame = false;
+      opponent->opponent = "";
+      opponent->isTurn = false;
+    }
+  }
+
+  auto it =
+      std::remove_if(players.begin(), players.end(),
+                     [&](const Player &p) { return p.login == pkt.sender; });
+
+  if (it != players.end()) {
+    players.erase(it, players.end());
+    std::cout << "[Logout] Player " << pkt.sender
+              << " removed from server's list.\n";
+  }
+}
+
+void ServerApp::run() {
+  serverPipe.removePipe();
+  if (!serverPipe.create()) {
+    std::cerr << "Fatal: Unable to create server pipe. Check access rights."
+              << std::endl;
+    return;
+  }
+
+  if (!serverPipe.openPipe(O_RDWR)) {
+    std::cerr << "Fatal: Unable to open pipe." << std::endl;
+    return;
+  }
+
+  std::cout << "Server running. Waiting..." << std::endl;
+
+  Packet pkt;
+  while (serverPipe.receive(&pkt, sizeof(Packet))) {
+    pthread_mutex_lock(&list_mutex);
+
+    switch (pkt.type) {
+    case LOGIN:
+      handleLogin(pkt);
+      break;
+    case INVITE:
+      handleInvite(pkt);
+      break;
+    case INVITE_RESPONSE:
+      handleInviteResponse(pkt);
+      break;
+    case SHOOT:
+      hanldeShoot(pkt);
+      break;
+    case LOGOUT:
+      handleLogout(pkt);
+      break;
+    }
+
+    pthread_mutex_unlock(&list_mutex);
+  }
+
+  serverPipe.closePipe();
+  serverPipe.removePipe();
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption=src/server/server\_main.cpp,captionpos=b]
+#include "ServerApp.h"
+
+#include <cstdlib>
+#include <ctime>
+
+int main() {
+  std::srand(std::time(nullptr));
+  ServerApp server;
+  server.run();
+  return 0;
+}
+\end{lstlisting}
+\pagebreak
+
+\section{Strace}
+\section{strace\_server}
+
+\begin{Verbatim}[breaklines=true, breakanywhere=true]
+92274 execve("./server", ["./server"], 0x7fffdb539568 /* 27 vars */) = 0
+92274 brk(NULL)                         = 0x563e7592e000
+92274 mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x72c19d397000
+92274 access("/etc/ld.so.preload", R_OK) = -1 ENOENT (No such file or directory)
+92274 openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+92274 fstat(3, {st_mode=S_IFREG|0644, st_size=20919, ...}) = 0
+92274 mmap(NULL, 20919, PROT_READ, MAP_PRIVATE, 3, 0) = 0x72c19d391000
+92274 close(3)                          = 0
+92274 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = 3
+92274 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+92274 fstat(3, {st_mode=S_IFREG|0644, st_size=2592224, ...}) = 0
+92274 mmap(NULL, 2609472, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x72c19d000000
+92274 mmap(0x72c19d09d000, 1343488, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x9d000) = 0x72c19d09d000
+92274 mmap(0x72c19d1e5000, 552960, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1e5000) = 0x72c19d1e5000
+92274 mmap(0x72c19d26c000, 57344, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x26b000) = 0x72c19d26c000
+92274 mmap(0x72c19d27a000, 12608, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x72c19d27a000
+92274 close(3)                          = 0
+92274 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = 3
+92274 read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+92274 fstat(3, {st_mode=S_IFREG|0644, st_size=183024, ...}) = 0
+92274 mmap(NULL, 185256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x72c19d363000
+92274 mmap(0x72c19d367000, 147456, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x4000) = 0x72c19d367000
+92274 mmap(0x72c19d38b000, 16384, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x72c19d38b000
+92274 mmap(0x72c19d38f000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2b000) = 0x72c19d38f000
+92274 close(3)                          = 0
+92274 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+92274 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\220\243\2\0\0\0\0\0"..., 832) = 832
+92274 pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+92274 fstat(3, {st_mode=S_IFREG|0755, st_size=2125328, ...}) = 0
+92274 pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+92274 mmap(NULL, 2170256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x72c19cc00000
+92274 mmap(0x72c19cc28000, 1605632, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x72c19cc28000
+92274 mmap(0x72c19cdb0000, 323584, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1b0000) = 0x72c19cdb0000
+92274 mmap(0x72c19cdff000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1fe000) = 0x72c19cdff000
+92274 mmap(0x72c19ce05000, 52624, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x72c19ce05000
+92274 close(3)                          = 0
+92274 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libm.so.6", O_RDONLY|O_CLOEXEC) = 3
+92274 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+92274 fstat(3, {st_mode=S_IFREG|0644, st_size=952616, ...}) = 0
+92274 mmap(NULL, 950296, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x72c19cf17000
+92274 mmap(0x72c19cf27000, 520192, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x10000) = 0x72c19cf27000
+92274 mmap(0x72c19cfa6000, 360448, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x8f000) = 0x72c19cfa6000
+92274 mmap(0x72c19cffe000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xe7000) = 0x72c19cffe000
+92274 close(3)                          = 0
+92274 mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x72c19d361000
+92274 mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x72c19d35e000
+92274 arch_prctl(ARCH_SET_FS, 0x72c19d35e740) = 0
+92274 set_tid_address(0x72c19d35ea10)   = 92274
+92274 set_robust_list(0x72c19d35ea20, 24) = 0
+92274 rseq(0x72c19d35f060, 0x20, 0, 0x53053053) = 0
+92274 mprotect(0x72c19cdff000, 16384, PROT_READ) = 0
+92274 mprotect(0x72c19cffe000, 4096, PROT_READ) = 0
+92274 mprotect(0x72c19d38f000, 4096, PROT_READ) = 0
+92274 mprotect(0x72c19d26c000, 45056, PROT_READ) = 0
+92274 mprotect(0x563e44225000, 4096, PROT_READ) = 0
+92274 mprotect(0x72c19d3cf000, 8192, PROT_READ) = 0
+92274 prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+92274 munmap(0x72c19d391000, 20919)     = 0
+92274 futex(0x72c19d27a7bc, FUTEX_WAKE_PRIVATE, 2147483647) = 0
+92274 getrandom("\x3b\x25\x57\x52\xef\xfa\x34\x25", 8, GRND_NONBLOCK) = 8
+92274 brk(NULL)                         = 0x563e7592e000
+92274 brk(0x563e7594f000)               = 0x563e7594f000
+92274 unlink("/tmp/battleship_server_pipe") = 0
+92274 mknodat(AT_FDCWD, "/tmp/battleship_server_pipe", S_IFIFO|0666) = 0
+92274 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_RDWR) = 3
+92274 fstat(1, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0x4), ...}) = 0
+92274 write(1, "Server running. Waiting...\n", 27) = 27
+92274 read(3, "\0\0\0\0loh\0\374\21\312a\365v\0\0\3\0\0\0\0\0\0\0\20\305\310a\365v\0\0"..., 592) = 592
+92274 write(1, "[Login] New player: loh\n", 24) = 24
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\5\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\0oh\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\0\0\0\0krut\0\301\177\273rp\0\0h~\355\35\376\177\0\0p~\355\35\376\177\0\0"..., 592) = 592
+92274 write(1, "[Login] New player: krut\n", 25) = 25
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\5\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\0rut\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\1\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\6\0\0\0krut\0\7\224u>V\0\0\320D\322.\374\177\0\0 \7\224u>V\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\5\0\0\0\374\177\0\0\3\0\0\0\0\0\0\0loh\0\374\177\0\0\320D\322.\374\177\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 write(1, "[Invite] krut -> loh\n", 21) = 21
+92274 read(3, "\2\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\7\0\0\0\374\177\0\0\4\0\0\0\0\0\0\0krut\0\0\0\0\370?\322.\374\177\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\7\0\0\0\374\177\0\0\4\0\0\0\0\0\0\0krut\0\0\0\0\370?\322.\374\177\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\0\0\0\0\0\0\\\"D>V\0\0\0\20=\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\0\0\0\0\0\0\\\"D>V\0\0\0\20=\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 write(1, "[Game Start] loh vs krut\n", 25) = 25
+92274 read(3, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] krut at (3, 0)\n", 23) = 23
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] krut at (0, 0)\n", 23) = 23
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (4, 0)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (4, 1)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (4, 2)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (2, 1)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (2, 2)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (0, 4)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (0, 5)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (0, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (1, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (2, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (3, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (4, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (5, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (6, 5)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (7, 6)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (7, 7)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (9, 5)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (8, 9)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (5, 9)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\10\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\n\0\0\0SERVER\0\235\301r\0\0\260\271'\235\301r\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 read(3, "\3\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Shoot] loh at (4, 9)\n", 22) = 22
+92274 openat(AT_FDCWD, "/tmp/client_loh", O_WRONLY) = 4
+92274 write(4, "\t\0\0\0\374\177\0\0\0\0\0\0\0\0\0\0\260=\322.\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 openat(AT_FDCWD, "/tmp/client_krut", O_WRONLY) = 4
+92274 write(4, "\t\0\0\0\374\177\0\0\3\0\0\0\0\0\0\0loh\0\374\177\0\0\4\271\v\235\301r\0\0"..., 592) = 592
+92274 close(4)                          = 0
+92274 write(1, "[Game Over] Winner:loh\n", 23) = 23
+92274 read(3, "\4\0\0\0loh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Logout] Player loh removed from"..., 48) = 48
+92274 read(3, "\4\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+92274 write(1, "[Logout] Player krut removed fro"..., 49) = 49
+92274 read(3, 0x7ffc2ed24260, 592)      = ? ERESTARTSYS (To be restarted if SA_RESTART is set)
+92274 --- SIGINT {si_signo=SIGINT, si_code=SI_KERNEL} ---
+92274 +++ killed by SIGINT +++
+\end{Verbatim}
+\pagebreak
+
+\section{strace\_client}
+\begin{Verbatim}[breaklines=true, breakanywhere=true]
+93922 execve("./client", ["./client"], 0x7fffdf487b68 /* 29 vars */) = 0
+93922 brk(NULL)                         = 0x648b8063d000
+93922 mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7de2cfce8000
+93922 access("/etc/ld.so.preload", R_OK) = -1 ENOENT (No such file or directory)
+93922 openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+93922 fstat(3, {st_mode=S_IFREG|0644, st_size=20919, ...}) = 0
+93922 mmap(NULL, 20919, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7de2cfce2000
+93922 close(3)                          = 0
+93922 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = 3
+93922 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+93922 fstat(3, {st_mode=S_IFREG|0644, st_size=2592224, ...}) = 0
+93922 mmap(NULL, 2609472, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7de2cfa00000
+93922 mmap(0x7de2cfa9d000, 1343488, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x9d000) = 0x7de2cfa9d000
+93922 mmap(0x7de2cfbe5000, 552960, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1e5000) = 0x7de2cfbe5000
+93922 mmap(0x7de2cfc6c000, 57344, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x26b000) = 0x7de2cfc6c000
+93922 mmap(0x7de2cfc7a000, 12608, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7de2cfc7a000
+93922 close(3)                          = 0
+93922 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = 3
+93922 read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+93922 fstat(3, {st_mode=S_IFREG|0644, st_size=183024, ...}) = 0
+93922 mmap(NULL, 185256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7de2cfcb4000
+93922 mmap(0x7de2cfcb8000, 147456, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x4000) = 0x7de2cfcb8000
+93922 mmap(0x7de2cfcdc000, 16384, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x7de2cfcdc000
+93922 mmap(0x7de2cfce0000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x2b000) = 0x7de2cfce0000
+93922 close(3)                          = 0
+93922 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+93922 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\220\243\2\0\0\0\0\0"..., 832) = 832
+93922 pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+93922 fstat(3, {st_mode=S_IFREG|0755, st_size=2125328, ...}) = 0
+93922 pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+93922 mmap(NULL, 2170256, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7de2cf600000
+93922 mmap(0x7de2cf628000, 1605632, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x7de2cf628000
+93922 mmap(0x7de2cf7b0000, 323584, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1b0000) = 0x7de2cf7b0000
+93922 mmap(0x7de2cf7ff000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1fe000) = 0x7de2cf7ff000
+93922 mmap(0x7de2cf805000, 52624, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7de2cf805000
+93922 close(3)                          = 0
+93922 openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libm.so.6", O_RDONLY|O_CLOEXEC) = 3
+93922 read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+93922 fstat(3, {st_mode=S_IFREG|0644, st_size=952616, ...}) = 0
+93922 mmap(NULL, 950296, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7de2cf917000
+93922 mmap(0x7de2cf927000, 520192, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x10000) = 0x7de2cf927000
+93922 mmap(0x7de2cf9a6000, 360448, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x8f000) = 0x7de2cf9a6000
+93922 mmap(0x7de2cf9fe000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xe7000) = 0x7de2cf9fe000
+93922 close(3)                          = 0
+93922 mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7de2cfcb2000
+93922 mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7de2cfcaf000
+93922 arch_prctl(ARCH_SET_FS, 0x7de2cfcaf740) = 0
+93922 set_tid_address(0x7de2cfcafa10)   = 93922
+93922 set_robust_list(0x7de2cfcafa20, 24) = 0
+93922 rseq(0x7de2cfcb0060, 0x20, 0, 0x53053053) = 0
+93922 mprotect(0x7de2cf7ff000, 16384, PROT_READ) = 0
+93922 mprotect(0x7de2cf9fe000, 4096, PROT_READ) = 0
+93922 mprotect(0x7de2cfce0000, 4096, PROT_READ) = 0
+93922 mprotect(0x7de2cfc6c000, 45056, PROT_READ) = 0
+93922 mprotect(0x648b677c8000, 4096, PROT_READ) = 0
+93922 mprotect(0x7de2cfd20000, 8192, PROT_READ) = 0
+93922 prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+93922 munmap(0x7de2cfce2000, 20919)     = 0
+93922 futex(0x7de2cfc7a7bc, FUTEX_WAKE_PRIVATE, 2147483647) = 0
+93922 getrandom("\xf2\x51\x28\xc2\xac\x7a\x18\xb8", 8, GRND_NONBLOCK) = 8
+93922 brk(NULL)                         = 0x648b8063d000
+93922 brk(0x648b8065e000)               = 0x648b8065e000
+93922 fstat(1, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0x6), ...}) = 0
+93922 write(1, "=== SEA FIGHT CLIENT ===\n", 25) = 25
+93922 write(1, "Enter your login: ", 18) = 18
+93922 fstat(0, {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0x6), ...}) = 0
+93922 read(0, "krut\n", 1024)           = 5
+93922 rt_sigaction(SIGRT_1, {sa_handler=0x7de2cf699530, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO, sa_restorer=0x7de2cf645330}, NULL, 8) = 0
+93922 rt_sigprocmask(SIG_UNBLOCK, [RTMIN RT_1], NULL, 8) = 0
+93922 mmap(NULL, 8392704, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7de2cedff000
+93922 mprotect(0x7de2cee00000, 8388608, PROT_READ|PROT_WRITE) = 0
+93922 rt_sigprocmask(SIG_BLOCK, ~[], [], 8) = 0
+93922 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7de2cf5ff990, parent_tid=0x7de2cf5ff990, exit_signal=0, stack=0x7de2cedff000, stack_size=0x7fff80, tls=0x7de2cf5ff6c0} => {parent_tid=[93935]}, 88) = 93935
+93935 rseq(0x7de2cf5fffe0, 0x20, 0, 0x53053053 <unfinished ...>
+93922 rt_sigprocmask(SIG_SETMASK, [],  <unfinished ...>
+93935 <... rseq resumed>)               = 0
+93922 <... rt_sigprocmask resumed>NULL, 8) = 0
+93935 set_robust_list(0x7de2cf5ff9a0, 24 <unfinished ...>
+93922 clock_nanosleep(CLOCK_REALTIME, 0, {tv_sec=1, tv_nsec=0},  <unfinished ...>
+93935 <... set_robust_list resumed>)    = 0
+93935 rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
+93935 mmap(NULL, 134217728, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7de2c6dff000
+93935 munmap(0x7de2c6dff000, 18878464)  = 0
+93935 munmap(0x7de2cc000000, 48230400)  = 0
+93935 mprotect(0x7de2c8000000, 135168, PROT_READ|PROT_WRITE) = 0
+93935 unlink("/tmp/client_krut")        = 0
+93935 mknodat(AT_FDCWD, "/tmp/client_krut", S_IFIFO|0666) = 0
+93935 openat(AT_FDCWD, "/tmp/client_krut", O_RDWR) = 3
+93935 read(3,  <unfinished ...>
+93922 <... clock_nanosleep resumed>0x7ffefe27e9f0) = 0
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\0\0\0\0krut\0\201\316\317\342}\0\0\250\353'\376\376\177\0\0\260\353'\376\376\177\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\5\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\0rut\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[SERVER]: Commands:\n", 20 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 20
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 write(1, "  /invite <login>  - Invite play"..., 35 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 35
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 write(1, "  /accept <login>  - Accept invi"..., 35 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 35
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 write(1, "  /shoot <x> <y>   - Shot (0-9)\n", 32 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 32
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 write(1, "  /quit            - Quit\n", 26 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 26
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 write(1, "> ", 2 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 2
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "Welcome to the Sea Fight server!"..., 33) = 33
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/invite loh\n", 1024) = 12
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\1\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\5\0\0\0\377\177\0\0\3\0\0\0\0\0\0\0loh\0\377\177\0\0\20\2\0\1\377\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[SERVER]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "Invite received to player loh! W"..., 50) = 50
+93935 read(3, "\7\0\0\0\377\177\0\0\4\0\0\0\0\0\0\0krut\0\0\0\08\375\377\0\377\177\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[GAME]: GAME HAS BEEN STARTED! O"..., 57) = 57
+93935 write(1, "[GAME]: Your ships are automatic"..., 78) = 78
+93935 read(3, "\n\0\0\0SERVER\0\0\0\0\0\0\0\214\324\226\352\\\0\0\0`\254\326\306\177\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "YOUR BOARD:\n  0 1 2 3 4 5 6 7 8 "..., 287) = 287
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 7 1\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (7, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 4 2\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (4, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 3 2\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (3, 2)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 4 3\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (4, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 3 3\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (3, 3)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 6 4\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (6, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 6 5\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (6, 5)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 5 5\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (5, 5)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 4 5\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (4, 5)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 3 5\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (3, 5)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 3 6\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (3, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 4 7\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (4, 7)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 5 7\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (5, 7)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 6 7\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n", 1 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (6, 7)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 5 9\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (5, 9)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 4 9\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (4, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 2 9\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (2, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 1 9\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 write(1, "[RESULT]: ", 10 <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93922 <... write resumed>)              = 10
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 1
+93935 <... futex resumed>)              = 0
+93922 read(0,  <unfinished ...>
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "HIT! Shoot again! (1, 9)\n", 25) = 25
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 1 8\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93935 <... read resumed>"\10\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 read(0,  <unfinished ...>
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "[RESULT]: HIT! Shoot again! (1, "..., 35) = 35
+93935 write(1, ">", 1)                  = 1
+93935 read(3, "\n\0\0\0SERVER\0\326\306\177\0\0\260\271\247\326\306\177\0\0 \0\0\0\0\0\0\0"..., 592) = 592
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "Opponent's board (Radar):\n  0 1 "..., 301) = 301
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, ">", 1)                  = 1
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/shoot 0 9\n", 1024) = 11
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\3\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4 <unfinished ...>
+93935 <... read resumed>"\t\0\0\0\377\177\0\0\0\0\0\0\0\0\0\0\360\372\377\0\377\177\0\0\4\271\213\326\306\177\0\0"..., 592) = 592
+93922 <... close resumed>)              = 0
+93935 write(1, "\n\n=============================="..., 39 <unfinished ...>
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 39
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93935 write(1, "               GAME OVER        "..., 41 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93922 futex(0x7de2cf805710, FUTEX_WAIT_PRIVATE, 2, NULL <unfinished ...>
+93935 <... write resumed>)              = 41
+93935 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1 <unfinished ...>
+93922 <... futex resumed>)              = 0
+93935 <... futex resumed>)              = 1
+93922 futex(0x7de2cf805710, FUTEX_WAKE_PRIVATE, 1) = 0
+93935 write(1, "================================"..., 40 <unfinished ...>
+93922 read(0,  <unfinished ...>
+93935 <... write resumed>)              = 40
+93935 write(1, "WIN! You destroy all opponent's "..., 38) = 38
+93935 write(1, "\n", 1)                 = 1
+93935 write(1, "================================"..., 40) = 40
+93935 write(1, "You are in main menu\n", 21) = 21
+93935 write(1, "Commands:\n", 10)       = 10
+93935 write(1, "  /invite <login>  - Invite play"..., 35) = 35
+93935 write(1, "  /accept <login>  - Accept invi"..., 35) = 35
+93935 write(1, "  /shoot <x> <y>   - Shot (0-9)\n", 32) = 32
+93935 write(1, "  /quit            - Quit\n", 26) = 26
+93935 write(1, "> ", 2)                 = 2
+93935 read(3,  <unfinished ...>
+93922 <... read resumed>"/qiute\n", 1024) = 7
+93922 write(1, "Invalid command.\n", 17) = 17
+93922 read(0, "/quit\n", 1024)          = 6
+93922 openat(AT_FDCWD, "/tmp/battleship_server_pipe", O_WRONLY) = 4
+93922 write(4, "\4\0\0\0krut\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 592) = 592
+93922 close(4)                          = 0
+93922 rt_sigaction(SIGRTMIN, {sa_handler=0x7de2cf69a840, sa_mask=[], sa_flags=SA_RESTORER|SA_RESTART|SA_SIGINFO, sa_restorer=0x7de2cf645330}, NULL, 8) = 0
+93922 rt_sigprocmask(SIG_BLOCK, ~[], [], 8) = 0
+93922 getpid()                          = 93922
+93922 tgkill(93922, 93935, SIGRTMIN)    = 0
+93935 <... read resumed>0x7de2cf5fec30, 592) = ? ERESTARTSYS (To be restarted if SA_RESTART is set)
+93922 rt_sigprocmask(SIG_SETMASK, [],  <unfinished ...>
+93935 --- SIGRTMIN {si_signo=SIGRTMIN, si_code=SI_TKILL, si_pid=93922, si_uid=1000} ---
+93922 <... rt_sigprocmask resumed>NULL, 8) = 0
+93935 getpid( <unfinished ...>
+93922 futex(0x7de2cf5ff990, FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME, 93935, NULL, FUTEX_BITSET_MATCH_ANY <unfinished ...>
+93935 <... getpid resumed>)             = 93922
+93935 futex(0x7de2cfce1230, FUTEX_WAKE_PRIVATE, 2147483647) = 0
+93935 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
+93935 madvise(0x7de2cedff000, 8368128, MADV_DONTNEED) = 0
+93935 exit(0)                           = ?
+93922 <... futex resumed>)              = 0
+93935 +++ exited with 0 +++
+93922 lseek(0, -1, SEEK_CUR)            = -1 ESPIPE (Illegal seek)
+93922 exit_group(0)                     = ?
+93922 +++ exited with 0 +++
+\end{Verbatim}
