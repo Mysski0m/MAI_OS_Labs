@@ -1,0 +1,169 @@
+\section{Метод решения}\\
+Для реализации консольной сетевой игры «Морской бой» выбрана архитектура клиент-сервер с топологией «Звезда». Взаимодействие между процессами (\texttt{IPC}) организовано через именованные каналы (\texttt{Named Pipes/FIFO}) в операционной системе Linux.
+\begin{itemize}
+    \item Сервер является центральным узлом, который хранит состояние всех подключенных пользователей, игровые поля и логику матчей. Он слушает один общий канал для входящих запросов.
+    \item Клиенты отвечают за взаимодействие с пользователем (ввод команд, вывод игрового поля). Каждый клиент создает собственный уникальный канал для получения ответов от сервера.
+    \item Для обеспечения асинхронного приема сообщений на клиенте используется библиотека POSIX Threads (\texttt{pthread}): отдельный поток отвечает за чтение данных из канала, в то время как основной поток обрабатывает пользовательский ввод.
+\end{itemize}
+
+Алгоритм решения задачи:
+
+\begin{enumerate}
+\item Запуск Сервера:
+    \begin{itemize}
+        \item Сервер создает главный именованный канал (\texttt{FIFO}) по фиксированному пути (\texttt{/tmp/battleship\_server\_pipe}) с правами доступа \texttt{0666}.
+        \item Канал открывается в режиме \texttt{O\_RDWR} (чтение и запись), чтобы дескриптор оставался открытым даже при отсутствии активных клиентов (предотвращение получения \texttt{EOF} в цикле чтения).
+        \item Сервер входит в бесконечный цикл ожидания пакетов (\texttt{struct Packet}) фиксированного размера из главного канала.
+    \end{itemize}
+
+\item Запуск Клиента и Авторизация:
+    \begin{itemize}
+        \item При запуске клиент запрашивает логин пользователя.
+        \item Создается уникальный именованный канал для приема сообщений: \texttt{/tmp/client\_<login>}.
+        \item Запускается фоновый поток (\texttt{listener\_thread}) с использованием \texttt{pthread\_create}, который открывает личный канал на чтение и блокируется в ожидании сообщений от сервера.
+        \item Клиент отправляет пакет типа \texttt{LOGIN} в общий канал сервера, сообщая свой идентификатор.
+    \end{itemize}
+
+\item Обработка запросов на Сервере:
+    \begin{itemize}
+        \item Сервер считывает \texttt{Packet} из общего канала.
+        \item Доступ к списку игроков защищен мьютексом (\texttt{pthread\_mutex}) для предотвращения состояний гонки.
+        \item В зависимости от типа пакета (\texttt{type}) вызывается соответствующий метод обработки (\texttt{handleLogin}, \texttt{handleInvite}, \texttt{handleShoot} и т.д.).
+        \item Для отправки ответа сервер временно открывает личный канал конкретного клиента (по пути \texttt{/tmp/client\_<target>}) в режиме \texttt{O\_WRONLY}, записывает ответ и закрывает дескриптор.
+    \end{itemize}
+
+\item Организация матча (Лобби):
+    \begin{itemize}
+        \item Пользователь вводит команду \texttt{/invite <username>}.
+        \item Сервер проверяет статус вызываемого игрока. Если он свободен, ему отправляется пакет \texttt{S\_INVITE}.
+        \item При согласии (\texttt{/accept}) сервер создает два экземпляра игрового поля (\texttt{GameBoard}), автоматически расставляет корабли случайным образом и определяет очередность хода.
+        \item Оба игрока получают уведомление \texttt{S\_GAME\_START} и текстовое представление своих полей.
+    \end{itemize}
+    
+\item Игровой процесс (Стрельба):
+    \begin{itemize}
+        \item Пользователь вводит команду \texttt{/shoot X Y}.
+        \item Сервер проверяет, является ли ход игрока текущим (\texttt{isTurn}).
+        \item Выполняется проверка координат на поле противника. Если попадание (\texttt{RES\_HIT}):
+            \begin{itemize}
+                \item Состояние клетки меняется на \texttt{HIT}.
+                \item Ход остается у атакующего.
+                \item Атакующему отправляется обновленная карта противника («Радар», где корабли скрыты).
+                \item Жертве отправляется карта её собственного флота с отображением повреждения.
+            \end{itemize}
+        \item Если промах (\texttt{RES\_MISS}):
+            \begin{itemize}
+                \item Состояние клетки меняется на \texttt{MISS}.
+                \item Ход переходит к противнику.
+            \end{itemize}
+    \end{itemize}
+
+\item Завершение игры:
+    \begin{itemize}
+        \item Если после выстрела счетчик живых клеток кораблей становится равен нулю, сервер фиксирует результат \texttt{RES\_LOSE}.
+        \item Обоим игрокам отправляется пакет \texttt{S\_GAME\_OVER} с соответствующим сообщением (Победа/Поражение).
+        \item Игровые статусы сбрасываются (\texttt{inGame} = \texttt{false}), игроки возвращаются в общее "меню" и могут начинать новые партии.
+    \end{itemize}
+
+\item Обработка отключений:
+    \begin{itemize}
+        \item При вводе команды \texttt{/quit} клиент отправляет пакет \texttt{LOGOUT} и завершает работу.
+        \item Сервер удаляет игрока из вектора активных пользователей.
+        \item Если игрок находился в активной партии, его противнику автоматически присуждается победа, и он возвращается в меню.
+    \end{itemize}
+
+\item Управление ресурсами:
+    \begin{itemize}
+        \item При завершении работы программы (как клиента, так и сервера) выполняется удаление файлов каналов из файловой системы с помощью системного вызова \texttt{unlink}, чтобы избежать накопления мусорных файлов в директории \texttt{/tmp}.
+    \end{itemize}
+
+\end{enumerate}
+
+\vspace{1\baselineskip}
+
+Архитектура программы:
+
+\dirtree{%
+.1 KP-var2/.  
+.2 build/.
+.2 include/.
+.3 ClientApp.h.
+.3 GameLogic.h.
+.3 ServerApp.h.
+.3 protocol.h.
+.3 wrappers.h.
+.2 src/.
+.3 client/.
+.4 ClientApp.cpp.
+.4 client\_main.cpp.
+.3 game/.
+.4 GameLogic.cpp.
+.3 server/.
+.4 ServerApp.cpp.
+.4 server\_main.cpp.
+.2 CMakeLists.txt.
+}
+
+Ссылки:
+
+\begin{itemize}
+\item \url{https://man7.org/linux/man-pages/man3/mkfifo.3.html}
+\item \url{https://man7.org/linux/man-pages/man3/pthread_create.3.html}
+\item \url{https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3.html}
+\item \url{https://man7.org/linux/man-pages/man7/pipe.7.html}
+\item \url{https://man7.org/linux/man-pages/man2/open.2.html}
+\item \url{https://www.gnu.org/software/libc/manual/html_node/Pipes-and-FIFOs.html}
+\item \url{https://beej.us/guide/bgipc/html/split/fifos.html}
+\item \url{https://hpc-tutorials.llnl.gov/posix/}
+\item \url{https://www.geeksforgeeks.org/named-pipe-or-fifo-with-example-c-program/}
+\end{itemize}
+
+\section{Описание программы}
+
+\texttt{protocol.h} — содержит общие структуры данных и константы для взаимодействия клиента и сервера.\\
+Основные определения:
+\begin{itemize}
+    \item \texttt{enum MsgType} — перечисление типов сообщений (\texttt{LOGIN}, \texttt{INVITE}, \texttt{SHOOT}, \texttt{S\_GAME\_START} и др.) для управления протоколом обмена.
+    \item \texttt{struct Packet} — структура фиксированного размера (\texttt{POD}), используемая для передачи данных через каналы. Содержит тип сообщения, логины отправителя/получателя, координаты и текстовую нагрузку.
+    \item \texttt{struct Player} — структура, хранящая состояние игрока на сервере (логин, текущий оппонент, флаг хода, объект игрового поля).
+\end{itemize}
+
+\texttt{wrappers.h} — инкапсулирует низкоуровневые системные вызовы Linux для работы с именованными каналами в класс C++.\\
+Основные функции:
+\begin{itemize}
+    \item \texttt{NamedPipe::create()} — создает файл FIFO в файловой системе с помощью вызова \texttt{mkfifo} и правами доступа \texttt{0666}.
+    \item \texttt{NamedPipe::openPipe(int mode)} — открывает канал с заданным режимом доступа (\texttt{O\_RDONLY}, \texttt{O\_WRONLY}, \texttt{O\_RDWR}).
+    \item \texttt{NamedPipe::send(...) / NamedPipe::receive(...)} — обертки над \texttt{write} и \texttt{read} для отправки и получения структур \texttt{Packet}.
+\end{itemize}
+
+\texttt{GameLogic.h/cpp} — реализует механику игры «Морской бой», управление игровым полем и проверку попаданий.\\
+Основные функции:
+\begin{itemize}
+    \item \texttt{void GameBoard::placeShipsRandomly()} — очищает поле и размещает корабли (размером от 1 до 4 клеток) случайным образом, проверяя границы и наложения.
+    \item \texttt{ShotResult GameBoard::processShot(int x, int y)} — обрабатывает выстрел по заданным координатам. Обновляет состояние клетки (\texttt{HIT}/\texttt{MISS}) и уменьшает счетчик живых частей кораблей. Возвращает статус выстрела (попал, мимо, победа, повтор).
+    \item \texttt{void GameBoard::getBoardString(char* buffer, bool showShips)} — генерирует строковое представление поля для отправки клиенту. Параметр showShips позволяет скрывать корабли для реализации «тумана войны» (вида для противника).
+\end{itemize}
+
+\texttt{ServerApp.h/cpp} — реализует логику центрального сервера, управляющего подключениями и игровым процессом.\\
+Основные функции:
+\begin{itemize}
+    \item \texttt{void ServerApp::run()} — основной цикл сервера. Читает сообщения из главного канала и распределяет их по обработчикам.
+    \item \texttt{void ServerApp::handleLogin(...)} — регистрирует нового игрока, добавляя его в вектор активных пользователей.
+    \item \texttt{void ServerApp::handleInvite(...) / handleInviteResponse(...)} — обрабатывает процесс создания матча: пересылает приглашения, создает пары игроков и инициализирует игровые поля при старте.
+    \item \texttt{void ServerApp::handleShoot(...)} — обрабатывает игровой ход. Проверяет очередность хода (\texttt{isTurn}), вызывает логику проверки попадания, отправляет результаты обоим игрокам и переключает ход при промахе.
+    \item \texttt{void ServerApp::sendBoardToPlayer(...)} — вспомогательный метод для отправки актуального состояния доски (своей или противника) клиенту.
+\end{itemize}
+
+\texttt{ClientApp.h/cpp} — реализует клиентское приложение с многопоточной обработкой.\\
+Основные функции:
+\begin{itemize}
+    \item \texttt{void ClientApp::start()} — основной цикл ввода команд пользователем (\texttt{/shoot}, \texttt{/invite}, \texttt{/quit}). Формирует пакеты и отправляет их в главный канал сервера.
+    \item \texttt{static void* listenThreadWrapper(...)} — точка входа для фонового потока \texttt{pthread}.
+    \item \texttt{void ClientApp::listenLoop()} — функция фонового потока. Непрерывно читает сообщения из личного канала клиента (\texttt{/tmp/client\_<login>}) и выводит информацию (сообщения чата, игровые поля, результаты выстрелов) в консоль.
+\end{itemize}
+
+\texttt{server\_main.cpp и client\_main.cpp} — точки входа.\\
+Основные функции:
+\begin{itemize}
+    \item \texttt{main()} — инициализируют генератор случайных чисел (\texttt{srand}), создают экземпляры классов \texttt{ServerApp} или \texttt{ClientApp} и запускают их основные циклы выполнения.
+\end{itemize}
